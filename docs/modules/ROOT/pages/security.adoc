@@ -1,25 +1,116 @@
-= Renarde image:renarde-head.svg[width=25em]  Web Framework Security guide
+= Renarde image:renarde-head.svg[width=25em] Web Framework Security guide
+:favicon: _images/renarde-head.svg
 
 include::./includes/attributes.adoc[]
 
 Renarde image:renarde-head.svg[width=15em] can help you deal with security and user registration, either manually, using OIDC, or
 a mix of both.
 
-== Custom authentication with JWT
+[#csrf]
+== CSRF
 
-In order to handle your own authentication by storing users in your database, you can use xref:security-jwt.adoc[JWT tokens].
-Start with importing the `renarde-oidc` module:
+Renarde comes with built-in support for https://owasp.org/www-community/attacks/csrf[Cross-Site Request Forgery (CSRF)] protection,
+via the (already imported) {quarkus-guides-url}/security-csrf-prevention[`quarkus-rest-csrf`] module dependency.
 
-[source,xml]
+To be safe, make sure that all your `GET`, `HEAD` and `OPTIONS` endpoints do not alter application state, and
+always include a CSRF token to your `POST`, `PUT`, `DELETE` (and other) endpoints. On your endpoint side, you
+do not need to do anything, we will check the token for you. But on your form end, you need to include the CSRF
+token, which can be done by using the xref:index.adoc#renarde-tags[`{#form/}`] tag to create your form, or the
+xref:index.adoc#renarde-tags[`{#authenticityToken/}`] to generate a hidden form element with the token, or by writing
+the form element manually:
+
+[source,html]
+----
+<input type="hidden" name="{inject:csrf.parameterName}" value="{inject:csrf.token}"/>
+----
+
+=== Tests when using CSRF
+
+When writing tests, if you are using {quarkus-guides-url}/getting-started-testing[`@QuarkusTest`] and
+https://rest-assured.io/[`RestAssured`] to test endpoints secured with CSRF protection,
+you will need to make sure you obtain and pass the appropriate CSRF token to your `POST` (and similar) endpoints.
+
+There are two ways to deal with this.
+
+=== The easy way
+
+Import the `quarkus-renarde-test` module:
+
+[source,xml,subs=attributes+]
 ----
 <dependency>
   <groupId>io.quarkiverse.renarde</groupId>
-  <artifactId>quarkus-renarde-oidc</artifactId>
-  <version>1.0.0-SNAPSHOT</version>
+  <artifactId>quarkus-renarde-test</artifactId>
+  <version>{quarkus-renarde-version}</version>
+  <scope>test</scope>
 </dependency>
 ----
 
-And set those configuration values: 
+This will automatically register a https://junit.org/junit5/docs/current/user-guide/#extensions-registration-automatic[JUnit Extension]
+which makes sure `RestAssured` has a filter set up for each of your
+test methods, which will pass a generated valid CSRF token as both cookie and form parameter. Not that this is only
+done for `POST` (and related) methods which contain either no body, or a form body 
+(https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods/POST[url-encoded or multipart]).
+
+NOTE: you can use the `@DisableCSRFFilter` annotation on your test method or class in order to disable the CSRF
+filter. For example, if you want to handle it yourself.
+
+=== The hard way
+
+You will need to obtain a CSRF token from any `GET` endpoint, and resend it as part of your `POST` requests:
+
+[source,java]
+----
+@Test
+public void test() {
+  String csrfToken = RestAssured
+    .given()
+    .when()
+    .get("/Application/index")
+    .then()
+    .extract().cookie("csrf-token");
+  // now we can call POST
+  RestAssured
+    .given()
+    .when()
+    // for CSRF protection
+    .cookie("csrf-token", csrfToken)
+    .param("csrf-token", csrfToken)
+    // for your actual endpoint
+    .param("param", "value")
+    .post("/Application/doSomething")
+    .then()
+    .statusCode(200);
+}
+----
+
+=== Disable CSRF for non Form Endpoints
+You can set the following configuration value to disable CSRF protection for non-form endpoints, such as REST APIs, in Quarkus:
+
+[source,properties]
+----
+# disable csrf validation for non form endpoints
+quarkus.rest-csrf.require-form-url-encoded=false
+----
+
+This configuration ensures that CSRF protection is only applied to form submissions, allowing REST API endpoints to operate without CSRF checks.
+
+[#custom_authentication_with_jwt]
+== Custom authentication with JWT
+
+In order to handle your own authentication by storing users in your database, you can use https://datatracker.ietf.org/doc/html/rfc7519[JWT tokens].
+Start with importing the `renarde-security` module:
+
+[source,xml,subs=attributes+]
+----
+<dependency>
+  <groupId>io.quarkiverse.renarde</groupId>
+  <artifactId>quarkus-renarde-security</artifactId>
+  <version>{quarkus-renarde-version}</version>
+</dependency>
+----
+
+And set those configuration values:
 
 [source,properties]
 ----
@@ -27,7 +118,10 @@ And set those configuration values:
 quarkus.http.auth.proactive=false
 ----
 
-Your entity should extend `RenardeUser` and can look like this:
+=== Out of the box support for form logins
+
+If you don't want to customise your login screen, and are using user/password security, you can opt to implement
+`RenardeUserWithPassword`, and Renarde will take care of the login redirect and use a JWT cookie for your login:
 
 [source,java]
 ----
@@ -36,13 +130,113 @@ package model;
 import java.util.HashSet;
 import java.util.Set;
 
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.EnumType;
-import javax.persistence.Enumerated;
-import javax.persistence.Table;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Table;
 
-import io.quarkiverse.renarde.oidc.RenardeUser;
+import io.quarkiverse.renarde.security.RenardeUserWithPassword;
+import io.quarkus.hibernate.orm.panache.PanacheEntity;
+
+@Entity
+@Table(name = "user_table")
+public class User extends PanacheEntity implements RenardeUserWithPassword {
+
+    @Column(unique = true)
+    public String userName;
+    public String password;<1>
+
+    @Override
+    public boolean registered(){
+        return true;
+    }
+
+    @Override
+    public Set<String> roles() {
+        return Collections.emptySet();
+    }
+
+    @Override
+    public String userId() {
+        return userName;
+    }
+
+    @Override
+    public String password() {
+        return password;
+    }
+
+    //
+    // Helpers
+
+    public static User findByUserName(String username) {
+        return find("LOWER(userName) = ?1", username.toLowerCase()).firstResult();
+    }
+}
+----
+<1> This assumes BCrypt hashing
+
+Now tell Renarde how to map the JWT cookies to your user model by implementing `RenardeUserProvider`:
+
+[source,java]
+----
+package util;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+import io.quarkiverse.renarde.security.RenardeSecurity;
+import io.quarkiverse.renarde.security.RenardeUser;
+import io.quarkiverse.renarde.security.RenardeUserProvider;
+import model.User;
+
+@ApplicationScoped
+public class MySecuritySetup implements RenardeUserProvider {
+
+    @Inject
+    RenardeSecurity security;
+
+    @Override
+    public RenardeUser findUser(String tenantId, String id) {
+        return User.findByUserName(id);
+    }
+}
+----
+
+With this, Renarde will make sure that we produce a `user` named bean containing the current user if there is a
+logged-in user. You can then use it in your views with `inject:user` or by injecting it in
+your endpoints.
+
+Renarde also provides a `ControllerWithUser` class which you can extend to access the current user for all controllers
+that need a user.
+
+You will also automatically get a login page with a form when attempting to log in, using your user table.
+
+NOTE: This automatic form is only enabled if you have no `@LoginPage` endpoint, and you have a `RenardeUserWithPassword`
+implementation.
+
+You can now use the `@Authenticated` annotation on your endpoints.
+
+=== Manual user registration and login
+
+If you want to implement a full-fledged user login and registration experience, with passwords, your entity should extend
+`RenardeUser` and can look like this:
+
+[source,java]
+----
+package model;
+
+import java.util.HashSet;
+import java.util.Set;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Table;
+
+import io.quarkiverse.renarde.security.RenardeUser;
 import io.quarkus.hibernate.orm.panache.PanacheEntity;
 
 @Entity
@@ -64,13 +258,14 @@ public class User extends PanacheEntity implements RenardeUser {
     @Column(nullable = false)
     @Enumerated(EnumType.STRING)
     public UserStatus status;
-    
-    public boolean isRegistered(){
+
+    @Override
+    public boolean registered(){
         return status == UserStatus.REGISTERED;
     }
 
     @Override
-    public Set<String> getRoles() {
+    public Set<String> roles() {
         Set<String> roles = new HashSet<>();
         if(isAdmin) {
             roles.add("admin");
@@ -79,7 +274,7 @@ public class User extends PanacheEntity implements RenardeUser {
     }
 
     @Override
-    public String getUserId() {
+    public String userId() {
         return userName;
     }
 
@@ -110,16 +305,16 @@ Now tell Renarde how to map the JWT cookies to your user model by implementing `
 ----
 package util;
 
-import javax.enterprise.context.ApplicationScoped;
-import javax.inject.Inject;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 
-import io.quarkiverse.renarde.oidc.RenardeSecurity;
-import io.quarkiverse.renarde.oidc.RenardeUser;
-import io.quarkiverse.renarde.oidc.RenardeUserProvider;
+import io.quarkiverse.renarde.security.RenardeSecurity;
+import io.quarkiverse.renarde.security.RenardeUser;
+import io.quarkiverse.renarde.security.RenardeUserProvider;
 import model.User;
 
 @ApplicationScoped
-public class MyOidcSetup implements RenardeUserProvider {
+public class MySecuritySetup implements RenardeUserProvider {
 
     @Inject
     RenardeSecurity security;
@@ -217,20 +412,21 @@ package rest;
 
 import java.util.UUID;
 
-import javax.inject.Inject;
-import javax.validation.constraints.Email;
-import javax.validation.constraints.NotBlank;
-import javax.ws.rs.POST;
-import javax.ws.rs.core.NewCookie;
-import javax.ws.rs.core.Response;
-import javax.ws.rs.core.Response.ResponseBuilder;
+import jakarta.inject.Inject;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.core.NewCookie;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.Response.ResponseBuilder;
 
 import org.hibernate.validator.constraints.Length;
 import org.jboss.resteasy.reactive.RestForm;
 import org.jboss.resteasy.reactive.RestQuery;
 
 import email.Emails;
-import io.quarkiverse.renarde.oidc.RenardeSecurity;
+import io.quarkiverse.renarde.security.LoginPage;
+import io.quarkiverse.renarde.security.RenardeSecurity;
 import io.quarkiverse.renarde.router.Router;
 import io.quarkiverse.renarde.util.StringUtils;
 import io.quarkus.elytron.security.common.BcryptUtil;
@@ -257,6 +453,7 @@ public class Login extends ControllerWithUser<User> {
     /**
      * Login page
      */
+    @LoginPage<1>
     public TemplateInstance login() {
         return Templates.login();
     }
@@ -385,6 +582,7 @@ public class Login extends ControllerWithUser<User> {
     }
 }
 ----
+<1> `@LoginPage` allows you to specify where the user should be redirected when they need to log in.
 
 You can now use the `@Authenticated` and `@RolesAllowed("admin")` annotations on your endpoints.
 
@@ -417,6 +615,7 @@ quarkus.native.resources.includes=publicKey.pem
 quarkus.native.resources.includes=privateKey.pem
 ----
 
+[[oidc]]
 == Using OIDC for login
 
 OIDC (Open ID Connect) is a way to delegate user login to external services, such as:
@@ -426,6 +625,8 @@ OIDC (Open ID Connect) is a way to delegate user login to external services, suc
 - xref:setting-up-oidc-for-google[Google]
 - xref:setting-up-oidc-for-facebook[Facebook]
 - xref:setting-up-oidc-for-microsoft[Microsoft]
+- xref:setting-up-oidc-for-spotify[Spotify]
+- xref:setting-up-oidc-for-twitter[Twitter]
 
 If you use OIDC, you can skip the email validation phase, and avoid storing passwords for your users, but you may
 likely still need to store a user representation in your data store, and associate it to the external identity provider
@@ -461,12 +662,12 @@ quarkus.http.auth.proactive=false
 
 Make sure you import the `renarde-oidc` module in your `pom.xml`:
 
-[source,xml]
+[source,xml,subs=attributes+]
 ----
 <dependency>
   <groupId>io.quarkiverse.renarde</groupId>
   <artifactId>quarkus-renarde-oidc</artifactId>
-  <version>1.0.0-SNAPSHOT</version>
+  <version>{quarkus-renarde-version}</version>
 </dependency>
 ----
 
@@ -479,14 +680,14 @@ package model;
 import java.util.HashSet;
 import java.util.Set;
 
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.EnumType;
-import javax.persistence.Enumerated;
-import javax.persistence.Table;
-import javax.persistence.UniqueConstraint;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Table;
+import jakarta.persistence.UniqueConstraint;
 
-import io.quarkiverse.renarde.oidc.RenardeUser;
+import io.quarkiverse.renarde.security.RenardeUser;
 import io.quarkus.hibernate.orm.panache.PanacheEntity;
 
 @Entity
@@ -511,13 +712,14 @@ public class User extends PanacheEntity implements RenardeUser {
     @Column(nullable = false)
     @Enumerated(EnumType.STRING)
     public UserStatus status;
-    
-    public boolean isRegistered(){
+
+    @Override
+    public boolean registered(){
         return status == UserStatus.REGISTERED;
     }
 
     @Override
-    public Set<String> getRoles() {
+    public Set<String> roles() {
         Set<String> roles = new HashSet<>();
         if(isAdmin) {
             roles.add("admin");
@@ -526,7 +728,7 @@ public class User extends PanacheEntity implements RenardeUser {
     }
 
     @Override
-    public String getUserId() {
+    public String userId() {
         return userName;
     }
 
@@ -568,15 +770,16 @@ package util;
 import java.net.URI;
 import java.util.UUID;
 
-import javax.enterprise.context.ApplicationScoped;
-import javax.inject.Inject;
-import javax.transaction.Transactional;
-import javax.ws.rs.core.Response;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.transaction.Transactional;
+import jakarta.ws.rs.core.Response;
 
 import io.quarkiverse.renarde.oidc.RenardeOidcHandler;
-import io.quarkiverse.renarde.oidc.RenardeSecurity;
-import io.quarkiverse.renarde.oidc.RenardeUser;
-import io.quarkiverse.renarde.oidc.RenardeUserProvider;
+import io.quarkiverse.renarde.oidc.RenardeOidcSecurity;
+import io.quarkiverse.renarde.security.RenardeSecurity;
+import io.quarkiverse.renarde.security.RenardeUser;
+import io.quarkiverse.renarde.security.RenardeUserProvider;
 import io.quarkiverse.renarde.router.Router;
 import io.quarkiverse.renarde.util.Flash;
 import io.quarkiverse.renarde.util.RedirectException;
@@ -586,11 +789,14 @@ import rest.Application;
 import rest.Login;
 
 @ApplicationScoped
-public class MyOidcSetup implements RenardeUserProvider, RenardeOidcHandler {
+public class MySecuritySetup implements RenardeUserProvider, RenardeOidcHandler {
 
     @Inject
     RenardeSecurity security;
-    
+
+    @Inject
+    RenardeOidcSecurity oidcSecurity;
+
     @Inject
     Flash flash;
 
@@ -621,10 +827,10 @@ public class MyOidcSetup implements RenardeUserProvider, RenardeOidcHandler {
             user.tenantId = tenantId;
             user.authId = authId;
             
-            user.email = security.getOidcEmail();
-            user.firstName = security.getOidcFirstName();
-            user.lastName = security.getOidcLastName();
-            user.userName = security.getOidcUserName();
+            user.email = oidcSecurity.getOidcEmail();
+            user.firstName = oidcSecurity.getOidcFirstName();
+            user.lastName = oidcSecurity.getOidcLastName();
+            user.userName = oidcSecurity.getOidcUserName();
 
             user.status = UserStatus.CONFIRMATION_REQUIRED;
             user.confirmationCode = UUID.randomUUID().toString();
@@ -632,7 +838,7 @@ public class MyOidcSetup implements RenardeUserProvider, RenardeOidcHandler {
 
             // go to registration
             uri = Router.getURI(Login::confirm, user.confirmationCode);
-        } else if(!user.isRegistered()) {
+        } else if(!user.registered()) {
             // user exists, but not fully registered yet
             // go to registration
             uri = Router.getURI(Login::confirm, user.confirmationCode);
@@ -658,7 +864,7 @@ public class MyOidcSetup implements RenardeUserProvider, RenardeOidcHandler {
         }
         // redirect to registration
         URI uri;
-        if(!user.isRegistered()) {
+        if(!user.registered()) {
             uri = Router.getURI(Login::confirm, ((User)user).confirmationCode);
         } else {
             flash.flash("message", "Already logged in");
@@ -764,11 +970,12 @@ And finally we can add the OIDC login options to the login page:
     <fieldset>
         <legend>Login/Register</legend>
         <div class="d-grid gap-2">
-          <a class="btn btn-block btn-light" href="{uri:RenardeSecurityController.loginUsingOidc('github')}" role="button"><img src="/images/signin-github.svg" height="16px" style="vertical-align: text-top"/> GitHub</a>
-          <a class="btn btn-block btn-light" href="{uri:RenardeSecurityController.loginUsingOidc('google')}" role="button"><img src="/images/signin-google.svg" height="16px" style="vertical-align: text-top"/> Google</a>
-          <a class="btn btn-block btn-light" href="{uri:RenardeSecurityController.loginUsingOidc('microsoft')}" role="button"><img src="/images/signin-microsoft.svg" height="16px" style="vertical-align: text-top"/> Microsoft</a>
-          <a class="btn btn-block btn-light" href="{uri:RenardeSecurityController.loginUsingOidc('facebook')}" role="button"><img src="/images/signin-facebook.svg" height="16px" style="vertical-align: text-top"/> Facebook</a>
-          <a class="btn btn-block btn-light" href="{uri:RenardeSecurityController.loginUsingOidc('apple')}" role="button"><img src="/images/signin-apple.svg" height="16px" style="vertical-align: text-top"/> Apple</a>
+          <a class="btn btn-block btn-light" href="{uri:RenardeOidcController.loginUsingOidc('github')}" role="button"><img src="/images/signin-github.svg" height="16px" style="vertical-align: text-top"/> GitHub</a>
+          <a class="btn btn-block btn-light" href="{uri:RenardeOidcController.loginUsingOidc('google')}" role="button"><img src="/images/signin-google.svg" height="16px" style="vertical-align: text-top"/> Google</a>
+          <a class="btn btn-block btn-light" href="{uri:RenardeOidcController.loginUsingOidc('microsoft')}" role="button"><img src="/images/signin-microsoft.svg" height="16px" style="vertical-align: text-top"/> Microsoft</a>
+          <a class="btn btn-block btn-light" href="{uri:RenardeOidcController.loginUsingOidc('facebook')}" role="button"><img src="/images/signin-facebook.svg" height="16px" style="vertical-align: text-top"/> Facebook</a>
+          <a class="btn btn-block btn-light" href="{uri:RenardeOidcController.loginUsingOidc('apple')}" role="button"><img src="/images/signin-apple.svg" height="16px" style="vertical-align: text-top"/> Apple</a>
+          <a class="btn btn-block btn-light" href="{uri:RenardeOidcController.loginUsingOidc('twitter')}" role="button"><img src="/images/signin-twitter.svg" height="16px" style="vertical-align: text-top"/> Twitter</a>
         </div>
      </fieldset>
   </div>
@@ -784,7 +991,7 @@ In order to set up OIDC for Github you need to create a new OAuth application in
 
 image::oidc-github-1.png[role="thumb"]
 
-Make sure to fill in the appropriate details, but more importantly the Authorization Callback URL, set to `http://localhost:8080/_renarde/security/github-success`
+Make sure to fill in the appropriate details, but more importantly the Authorization Callback URL, set to `http://localhost:8080/_renarde/security/oidc-success`
 (if you intend to test this using the Quarkus DEV mode).
 
 Now click on `Register application` and you'll be shown your application page:
@@ -901,7 +1108,7 @@ quarkus.oidc.microsoft.credentials.secret=<Secret>
 
 In order to set up OIDC for Apple you need to create a developer account, and sign up for the 99€/year program, but you cannot test your application on `localhost` like most other OIDC providers: 
 you will need to run it over `https` and make it publicly accessible, so for development purposes
-you may want to use a service such as https://ngrok.com.
+you may want to use a service such as https://github.com/quarkiverse/quarkus-ngrok[ngrok].
 
 Go to https://developer.apple.com/account/resources/identifiers/list[Create a new identifier] and press `+`
 
@@ -991,7 +1198,7 @@ Write down your `Key ID`, download your key and save it to your Quarkus applicat
 
 image::oidc-apple-22.png[role="thumb"]
 
-You can now configure your your `application.properties`:
+You can now configure your `application.properties`:
 
 [source,properties]
 ----
@@ -1007,7 +1214,7 @@ quarkus.oidc.apple.credentials.jwt.subject=<Bundle ID}
 
 Facebook you will not be let you test your application on `localhost` like most other OIDC providers: 
 you will need to run it over `https` and make it publicly accessible, so for development purposes
-you may want to use a service such as https://ngrok.com.
+you may want to use a service such as https://github.com/quarkiverse/quarkus-ngrok[ngrok].
 
 In order to set up OIDC for Facebook start by https://developers.facebook.com/apps/create/[Creating an application], select `None` as an app type, and press `Next`:
 
@@ -1033,13 +1240,38 @@ Now go to `Settings > Basic` on the left hand menu, and write down your `App ID`
 
 image::oidc-facebook-6.png[role="thumb"]
 
-You can now configure your your `application.properties`:
+You can now configure your `application.properties`:
 
 [source,properties]
 ----
 quarkus.oidc.facebook.provider=facebook
 quarkus.oidc.facebook.client-id=<App ID>
 quarkus.oidc.facebook.credentials.secret=<App secret>
+----
+
+=== Setting up OIDC for Spotify
+
+In order to set up OIDC for Spotify start by https://developer.spotify.com/dashboard/create[Creating an app], enter an app name, 
+and `http://localhost:8080/_renarde/security/oidc-success` as `Redirect URI`, check the checkbox accepting the terms,
+and press `Save`:
+
+image::oidc-spotify-1.png[role="thumb"]
+
+Now click on `Settings`:
+
+image::oidc-spotify-2.png[role="thumb"]
+
+And click on `View client secret` in order to reveal your secret:
+
+image::oidc-spotify-3.png[role="thumb"]
+
+Now copy your `Client ID` and `Client secret` into your `application.properties`:
+
+[source,properties]
+----
+quarkus.oidc.spotify.provider=spotify
+quarkus.oidc.spotify.client-id=<Client ID>
+quarkus.oidc.spotify.credentials.secret=<Client Secret>
 ----
 
 === Setting up OIDC for Twitter
@@ -1075,11 +1307,11 @@ Check the `OAuth 2.0` check box:
 
 image::oidc-twitter-7.png[role="thumb"]
 
-Select `Web App` as application type, then fill in your application details (use `<host>/_renarde/security/twitter-success`
+Select `Web App` as application type, then fill in your application details (use `<host>/_renarde/security/oidc-success`
 for the `Callback URI`).
 
 NOTE: Twitter doesn't require https usage in practice, but won't accept your `Website URL` without it, so
-you can still use ngrok for it.
+you can still use https://github.com/quarkiverse/quarkus-ngrok[ngrok] for it.
 
 Now press `Save`:
 
@@ -1089,7 +1321,7 @@ You can now copy your `Client ID` and `Client Secret` and press `Done`:
 
 image::oidc-twitter-9.png[role="thumb"]
 
-You can now configure your your `application.properties`:
+You can now configure your `application.properties`:
 
 [source,properties]
 ----
@@ -1097,3 +1329,117 @@ quarkus.oidc.twitter.provider=twitter
 quarkus.oidc.twitter.client-id=<Client ID>
 quarkus.oidc.twitter.credentials.secret=<Client Secret>
 ----
+
+=== Testing OIDC providers
+
+As soon as you integrate OIDC providers in your application, testing them becomes problematic,
+because you probably don't want to hit those external OIDC systems from your tests. But you still
+want to test that your integration works well, and make it as fast as possible.
+
+Renarde provides you with https://quarkus.io/guides/getting-started-testing#annotation-based-test-resources[custom test resources]
+that will start mock OIDC providers that you can use in place of the real online OIDC providers. All you need to
+do is import this module:
+
+[source,xml,subs=attributes+]
+----
+<dependency>
+  <groupId>io.quarkiverse.renarde</groupId>
+  <artifactId>quarkus-renarde-oidc-tests</artifactId>
+  <version>{quarkus-renarde-version}</version>
+  <scope>test</scope>
+</dependency>
+----
+
+And place one of these annotations on your test resource:
+
+[cols="1,1"]
+|===
+|Annotation|Role
+
+|`@MockAppleOidc`
+|Starts a mock Apple OIDC provider
+
+|`@MockFacebookOidc`
+|Starts a mock Facebook OIDC provider
+
+|`@MockGithubOidc`
+|Starts a mock Github OIDC provider
+
+|`@MockGoogleOidc`
+|Starts a mock Google OIDC provider
+
+|`@MockMicrosoftOidc`
+|Starts a mock Microsoft OIDC provider
+
+|`@MockSpotifyOidc`
+|Starts a mock Spotify OIDC provider
+
+|`@MockTwitterOidc`
+|Starts a mock Twitter OIDC provider
+
+|===
+
+All these mock OIDC providers will automatically log you in for a single fixed user with the following
+properties:
+
+[cols="1,1,1,1,1,1,1"]
+|===
+|Provider|TenantId|AuthId|Username|First name|Last name|Email
+
+|Apple
+|`apple`
+|`USERID`
+|`null` (Not provided by Apple)
+|`null` (Not provided by Apple)
+|`null` (Not provided by Apple)
+|`apple@example.com`
+
+|Facebook
+|`facebook`
+|`USERID`
+|`null` (Not provided by Facebook)
+|`Foo`
+|`Bar`
+|`facebook@example.com`
+
+|Github
+|`github`
+|`1234`
+|`GithubUser`
+|`Foo`
+|`Bar`
+|`github@example.com`
+
+|Google
+|`google`
+|`USERID`
+|`null` (Not provided by Google)
+|`Foo`
+|`Bar`
+|`google@example.com`
+
+|Microsoft
+|`microsoft`
+|`USERID`
+|`microsoft@example.com` (Microsoft uses the email)
+|`Foo`
+|`Bar`
+|`microsoft@example.com`
+
+|Spotify
+|`spotify`
+|`USERID`
+|`null` (Not provided by Spotify)
+|`Foo`
+|`Bar`
+|`spotify@example.com`
+
+|Twitter
+|`twitter`
+|`USERID`
+|`null` (Not provided by Twitter)
+|`Foo`
+|`Bar`
+|`twitter@example.com`
+
+|===

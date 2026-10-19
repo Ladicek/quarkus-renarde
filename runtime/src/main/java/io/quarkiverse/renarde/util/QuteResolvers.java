@@ -4,17 +4,21 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map.Entry;
 import java.util.concurrent.CompletionStage;
+import java.util.function.BiFunction;
 
-import javax.enterprise.event.Observes;
+import jakarta.enterprise.event.Observes;
 
 import io.quarkiverse.renarde.router.Router;
+import io.quarkus.arc.Arc;
 import io.quarkus.qute.CompletedStage;
 import io.quarkus.qute.EngineBuilder;
 import io.quarkus.qute.EvalContext;
 import io.quarkus.qute.Expression;
 import io.quarkus.qute.NamespaceResolver;
 import io.quarkus.qute.ValueResolver;
+import io.quarkus.qute.i18n.MessageBundles;
 import io.smallrye.mutiny.Uni;
 
 public class QuteResolvers {
@@ -29,25 +33,92 @@ public class QuteResolvers {
         }
     }
 
+    static class MessageKey {
+        public final String key;
+        public boolean isPendingAppendOperation;
+
+        public MessageKey(String key) {
+            if (key.startsWith("'") && key.endsWith("'")) {
+                this.key = key.substring(1, key.length() - 1);
+            } else {
+                this.key = key;
+            }
+        }
+
+        public MessageKey append(String postfix, boolean addDot) {
+            if (!addDot) {
+                return new MessageKey(key + postfix);
+            } else {
+                return new MessageKey(key + "." + postfix);
+            }
+        }
+
+        // used by Qute for the rendering without parameters
+        public String toString() {
+            return render();
+        }
+
+        public String render(Object... params) {
+            I18N i18n = Arc.container().instance(I18N.class).get();
+            return params.length > 0 ? i18n.formatMessage(key, params) : i18n.getMessage(key);
+        }
+
+        public Object renderIfParameters(EvalContext ctx) {
+            if (ctx.getParams().isEmpty()) {
+                return this;
+            } else {
+                return evaluateParameters(ctx, (ctx2, params) -> render(params.toArray()));
+            }
+        }
+    }
+
     void configureEngine(@Observes EngineBuilder builder) {
         builder.addValueResolver(ValueResolver.builder()
-                .appliesTo(ctx -> ctx.getBase() instanceof BoundRouter)
+                .appliesTo(ctx -> (ctx.getBase() instanceof MessageKey))
                 .resolveSync(ctx -> {
-                    List<Expression> params = ctx.getParams();
-                    if (params.isEmpty()) {
-                        return CompletedStage.of(findURI(ctx, Collections.emptyList()));
-                    } else {
-                        List<Uni<Object>> unis = new ArrayList<>(params.size());
-                        for (int i = 0; i < params.size(); i++) {
-                            CompletionStage<Object> val = ctx.evaluate(params.get(i));
-                            Uni<Object> uni = Uni.createFrom().completionStage(val);
-                            unis.add(uni);
+                    MessageKey base = ((MessageKey) ctx.getBase());
+                    String name = ctx.getName().strip();
+                    if (name.equals("+")) {
+                        if (ctx.getParams().isEmpty()) {
+                            // if the + is not followed by parameter, or a direct new line, for example if it is followed by a space then a new line
+                            // we will get empty parameters and get called again later with what's on the next line, so remember we wanted to append
+                            base.isPendingAppendOperation = true;
+                            return base;
                         }
-                        return Uni.combine().all().unis(unis)
-                                .collectFailures().combinedWith(paramValues -> findURI(ctx, paramValues))
-                                .convert().toCompletionStage();
+                        base.isPendingAppendOperation = false;
+                        return evaluateParameters(ctx, (ctx2, params) -> {
+                            if (params.size() == 1) {
+                                return base.append(params.get(0).toString(), false);
+                            } else {
+                                throw new RuntimeException("'+' operator must have exactly one right-hand-side expressions");
+                            }
+                        });
+                    } else {
+                        if (base.isPendingAppendOperation) {
+                            // remove quoting
+                            // this one is nuts, but I've seen it
+                            if (name.endsWith(")")) {
+                                name = name.substring(0, name.length() - 1);
+                            }
+                            if (name.startsWith("'") && name.endsWith("'")) {
+                                name = name.substring(1, name.length() - 1);
+                            }
+                        }
+                        if (name.equals("$render")) {
+                            return base.render();
+                        }
+                        MessageKey key = base.append(name, !base.isPendingAppendOperation);
+                        base.isPendingAppendOperation = false;
+                        return key.renderIfParameters(ctx);
                     }
                 })
+                .build());
+        builder.addNamespaceResolver(NamespaceResolver.builder("m")
+                .resolve(ctx -> new MessageKey(ctx.getName()).renderIfParameters(ctx))
+                .build());
+        builder.addValueResolver(ValueResolver.builder()
+                .appliesTo(ctx -> ctx.getBase() instanceof BoundRouter)
+                .resolveSync(ctx -> evaluateParameters(ctx, this::findURI))
                 .build());
         builder.addNamespaceResolver(NamespaceResolver.builder("uri")
                 .resolve(ctx -> new BoundRouter(ctx.getName(), false))
@@ -57,11 +128,44 @@ public class QuteResolvers {
                 .build());
     }
 
+    void registerTemplateInstanceLocaleAndRenderArgs(@Observes EngineBuilder engineBuilder, I18N i18n, RenderArgs renderArgs) {
+        engineBuilder.addTemplateInstanceInitializer(templateInstance -> {
+            // This should work if `I18N` is a request scoped bean
+            if (Arc.container().requestContext().isActive()) {
+                if (i18n.getLocale() != null
+                        && templateInstance.getAttribute(MessageBundles.ATTRIBUTE_LOCALE) == null) {
+                    templateInstance.setAttribute(MessageBundles.ATTRIBUTE_LOCALE, i18n.getLocale());
+                }
+                // extra parameters
+                for (Entry<String, Object> entry : renderArgs.entrySet()) {
+                    templateInstance.data(entry.getKey(), entry.getValue());
+                }
+            }
+        });
+    }
+
     private URI findURI(EvalContext ctx, List<?> paramValues) {
         BoundRouter boundRouter = (BoundRouter) ctx.getBase();
         // FIXME: make it work for multiple sets of parameters? with optional query params that's a bit harder
         // but probably GET/PUT/POST/DELETE will all have the same required set and URI?
         String route = boundRouter.target + "." + ctx.getName();
         return Router.findURI(route, boundRouter.absolute, paramValues.toArray());
+    }
+
+    static <R> CompletionStage<R> evaluateParameters(EvalContext ctx, BiFunction<EvalContext, List<?>, R> mapper) {
+        List<Expression> params = ctx.getParams();
+        if (params.isEmpty()) {
+            return CompletedStage.of(mapper.apply(ctx, Collections.emptyList()));
+        } else {
+            List<Uni<Object>> unis = new ArrayList<>(params.size());
+            for (int i = 0; i < params.size(); i++) {
+                CompletionStage<Object> val = ctx.evaluate(params.get(i));
+                Uni<Object> uni = Uni.createFrom().completionStage(val);
+                unis.add(uni);
+            }
+            return Uni.combine().all().unis(unis)
+                    .collectFailures().combinedWith(paramValues -> mapper.apply(ctx, paramValues))
+                    .convert().toCompletionStage();
+        }
     }
 }

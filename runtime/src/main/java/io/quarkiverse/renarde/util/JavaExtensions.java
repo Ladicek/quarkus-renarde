@@ -3,6 +3,8 @@ package io.quarkiverse.renarde.util;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.sql.Blob;
+import java.sql.SQLException;
 import java.text.SimpleDateFormat;
 import java.time.Duration;
 import java.time.LocalDate;
@@ -131,6 +133,48 @@ public class JavaExtensions {
             return val;
         // FIXME: doesn't respect codepoints, perhaps not even the Turkish capital i?
         return val.substring(0, 1).toUpperCase() + val.substring(1);
+    }
+
+    public static String binarySize(int value) {
+        return binarySize((long) value);
+    }
+
+    public static String binarySize(long value) {
+        // https://en.wikipedia.org/wiki/Byte#Units_based_on_powers_of_10
+        if (value < 1000)
+            return value + "B";
+        double rounded = (double) value / 1000;
+        if (rounded < 1000)
+            return String.format("%.2fkB", rounded);
+        rounded /= 1000;
+        if (rounded < 1000)
+            return String.format("%.2fMB", rounded);
+        rounded /= 1000;
+        if (rounded < 1000)
+            return String.format("%.2fGB", rounded);
+        rounded /= 1000;
+        if (rounded < 1000)
+            return String.format("%.2fTB", rounded);
+        rounded /= 1000;
+        return String.format("%.2fPB", rounded);
+    }
+
+    public static String mimeType(byte[] bytes) {
+        if (bytes == null || bytes.length == 0) {
+            return null;
+        }
+        return FileUtils.getMimeType("", bytes);
+    }
+
+    public static String mimeType(Blob blob) {
+        try {
+            if (blob == null || blob.length() == 0) {
+                return null;
+            }
+            return FileUtils.getMimeType("", blob.getBytes(0l, (int) blob.length()));
+        } catch (SQLException e) {
+            return null;
+        }
     }
 
     @TemplateExtension(namespace = "flash", matchName = "*")

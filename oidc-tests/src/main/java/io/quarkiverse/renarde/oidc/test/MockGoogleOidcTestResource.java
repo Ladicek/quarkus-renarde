@@ -14,16 +14,16 @@ import java.util.UUID;
 import org.eclipse.microprofile.jwt.Claims;
 
 import io.smallrye.jwt.build.Jwt;
-import io.vertx.mutiny.ext.web.Router;
-import io.vertx.mutiny.ext.web.RoutingContext;
-import io.vertx.mutiny.ext.web.handler.BodyHandler;
+import io.vertx.ext.web.Router;
+import io.vertx.ext.web.RoutingContext;
+import io.vertx.ext.web.handler.BodyHandler;
 
 public class MockGoogleOidcTestResource extends MockOidcTestResource<MockGoogleOidc> {
 
     private KeyPair kp;
 
     public MockGoogleOidcTestResource() {
-        super("google", 50000);
+        super("google");
     }
 
     @Override
@@ -33,6 +33,7 @@ public class MockGoogleOidcTestResource extends MockOidcTestResource<MockGoogleO
         router.get("/o/oauth2/v2/auth").handler(this::authorize);
         router.post("/token").handler(bodyHandler).handler(this::accessTokenJson);
         router.get("/oauth2/v3/certs").handler(this::getKeys);
+        router.get("/v1/userinfo").handler(this::userinfo);
 
         KeyPairGenerator kpg;
         try {
@@ -104,7 +105,7 @@ public class MockGoogleOidcTestResource extends MockOidcTestResource<MockGoogleO
                 + " ]\n"
                 + "}";
         rc.response().putHeader("Content-Type", "application/json");
-        rc.endAndForget(data);
+        rc.end(data);
     }
 
     /*
@@ -134,7 +135,7 @@ public class MockGoogleOidcTestResource extends MockOidcTestResource<MockGoogleO
         rc.response()
                 .putHeader("Location", redirect.toASCIIString())
                 .setStatusCode(302)
-                .endAndForget();
+                .end();
     }
 
     /*
@@ -175,7 +176,7 @@ public class MockGoogleOidcTestResource extends MockOidcTestResource<MockGoogleO
         UUID token = UUID.randomUUID();
         String hashedToken = hashAccessToken(token.toString());
         String idToken = Jwt.issuer("https://accounts.google.com")
-                .audience("SOMETHING")
+                .audience("GGLCLIENT")
                 .claim(Claims.azp, "SOMETHING")
                 .subject("USERID")
                 .claim(Claims.email, "google@example.com")
@@ -201,7 +202,7 @@ public class MockGoogleOidcTestResource extends MockOidcTestResource<MockGoogleO
                 + "}\n";
         rc.response()
                 .putHeader("Content-Type", "application/json")
-                .endAndForget(data);
+                .end(data);
     }
 
     private void getKeys(RoutingContext rc) {
@@ -222,6 +223,22 @@ public class MockGoogleOidcTestResource extends MockOidcTestResource<MockGoogleO
                 + "}";
         rc.response()
                 .putHeader("Content-Type", "application/json")
-                .endAndForget(data);
+                .end(data);
+    }
+
+    private void userinfo(RoutingContext rc) {
+        String data = "{\n"
+                + "  \"sub\": \"USERID\",\n"
+                + "  \"name\": \"Foo Bar\",\n"
+                + "  \"given_name\": \"Foo\",\n"
+                + "  \"family_name\": \"Bar\",\n"
+                + "  \"picture\": \"https://example.com/picture\",\n"
+                + "  \"email\": \"google@example.com\",\n"
+                + "  \"email_verified\": true,\n"
+                + "  \"locale\": \"en-GB\"\n"
+                + "}";
+        rc.response()
+                .putHeader("Content-Type", "application/json")
+                .end(data);
     }
 }

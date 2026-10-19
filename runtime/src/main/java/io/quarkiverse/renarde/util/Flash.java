@@ -8,17 +8,18 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-import javax.enterprise.context.RequestScoped;
-import javax.enterprise.inject.spi.CDI;
-import javax.inject.Inject;
-import javax.inject.Named;
+import jakarta.enterprise.context.RequestScoped;
+import jakarta.enterprise.inject.spi.CDI;
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
 
 import org.jboss.resteasy.reactive.server.core.ResteasyReactiveRequestContext;
 import org.jboss.resteasy.reactive.server.core.multipart.FormData;
-import org.jboss.resteasy.reactive.server.core.multipart.FormData.FormValue;
+import org.jboss.resteasy.reactive.server.multipart.FormValue;
 
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.core.http.Cookie;
+import io.vertx.core.http.CookieSameSite;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.json.Json;
@@ -40,16 +41,19 @@ public class Flash {
     public final static String FLASH_COOKIE_NAME = "_renarde_flash";
 
     public void setFlashCookie() {
-        setFlashCookie(request.response(), futureValues);
+        setFlashCookie(request, request.response(), futureValues);
     }
 
-    public static void setFlashCookie(HttpServerResponse response, Map<String, Object> values) {
+    public static void setFlashCookie(HttpServerRequest request, HttpServerResponse response, Map<String, Object> values) {
         // FIXME: expiry, others?
         // in some cases with exception mappers, it appears the filters get invoked twice
         if (!response.headWritten())
             response.addCookie(
                     Cookie.cookie(FLASH_COOKIE_NAME, encodeCookieValue(values))
-                            .setPath("/"));
+                            .setPath("/")
+                            .setHttpOnly(true)
+                            .setSameSite(CookieSameSite.LAX)
+                            .setSecure(request.isSSL()));
     }
 
     public static String encodeCookieValue(Map<String, Object> values) {
@@ -133,11 +137,6 @@ public class Flash {
     public <T> T get(String key) {
         // FIXME: is this really about the previous values or the future ones?
         return (T) values.get(key);
-    }
-
-    // FIXME: this is just to get around not being able to prefix error. in Qute
-    public <T> T getError(String key) {
-        return (T) values.get("error." + key);
     }
 
     public Map<String, Object> values() {

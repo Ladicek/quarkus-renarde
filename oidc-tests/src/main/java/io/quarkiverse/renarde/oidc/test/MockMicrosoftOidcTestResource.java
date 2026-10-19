@@ -14,16 +14,17 @@ import java.util.UUID;
 import org.eclipse.microprofile.jwt.Claims;
 
 import io.smallrye.jwt.build.Jwt;
-import io.vertx.mutiny.ext.web.Router;
-import io.vertx.mutiny.ext.web.RoutingContext;
-import io.vertx.mutiny.ext.web.handler.BodyHandler;
+import io.vertx.ext.web.Router;
+import io.vertx.ext.web.RoutingContext;
+import io.vertx.ext.web.handler.BodyHandler;
 
 public class MockMicrosoftOidcTestResource extends MockOidcTestResource<MockMicrosoftOidc> {
 
     private KeyPair kp;
+    private String clientId;
 
     public MockMicrosoftOidcTestResource() {
-        super("microsoft", 50002);
+        super("microsoft");
     }
 
     @Override
@@ -33,6 +34,7 @@ public class MockMicrosoftOidcTestResource extends MockOidcTestResource<MockMicr
         router.get("/common/oauth2/v2.0/authorize").handler(this::authorize);
         router.post("/common/oauth2/v2.0/token").handler(bodyHandler).handler(this::accessTokenJson);
         router.get("/common/discovery/v2.0/keys").handler(this::getKeys);
+        router.get("/oidc/userinfo").handler(this::userinfo);
 
         KeyPairGenerator kpg;
         try {
@@ -113,7 +115,7 @@ public class MockMicrosoftOidcTestResource extends MockOidcTestResource<MockMicr
                 + "   \"rbac_url\":\"https://pas.windows.net\"\n"
                 + "}";
         rc.response().putHeader("Content-Type", "application/json");
-        rc.endAndForget(data);
+        rc.end(data);
     }
 
     /*
@@ -127,7 +129,8 @@ public class MockMicrosoftOidcTestResource extends MockOidcTestResource<MockMicr
      */
     private void authorize(RoutingContext rc) {
         String response_type = rc.request().params().get("response_type");
-        String client_id = rc.request().params().get("client_id");
+        // save the client id for later
+        clientId = rc.request().params().get("client_id");
         String scope = rc.request().params().get("scope");
         String state = rc.request().params().get("state");
         String redirect_uri = rc.request().params().get("redirect_uri");
@@ -141,7 +144,7 @@ public class MockMicrosoftOidcTestResource extends MockOidcTestResource<MockMicr
         rc.response()
                 .putHeader("Location", redirect.toASCIIString())
                 .setStatusCode(302)
-                .endAndForget();
+                .end();
     }
 
     /*
@@ -163,7 +166,7 @@ public class MockMicrosoftOidcTestResource extends MockOidcTestResource<MockMicr
      * "ver": "2.0",
      * "iss": "https://login.microsoftonline.com/TENANTID/v2.0",
      * "sub": "USERID",
-     * "aud": "OPAQUE",
+     * "aud": "CLIENTID",
      * "exp": 1641906214,
      * "iat": 1641819514,
      * "nbf": 1641819514,
@@ -184,11 +187,10 @@ public class MockMicrosoftOidcTestResource extends MockOidcTestResource<MockMicr
         UUID tenant = UUID.randomUUID();
         String hashedToken = hashAccessToken(token.toString());
         String idToken = Jwt.issuer("https://accounts.google.com")
-                .audience("SOMETHING")
                 .claim("ver", "2.0")
                 .issuer(baseURI + "/" + tenant + "/v2.0")
                 .subject("USERID")
-                .audience(UUID.randomUUID().toString())
+                .audience(clientId)
                 .expiresIn(Duration.ofDays(1))
                 .issuedAt(Instant.now())
                 .claim(Claims.nbf, Instant.now())
@@ -212,7 +214,7 @@ public class MockMicrosoftOidcTestResource extends MockOidcTestResource<MockMicr
                 + " }  ";
         rc.response()
                 .putHeader("Content-Type", "application/json")
-                .endAndForget(data);
+                .end(data);
     }
 
     /*
@@ -248,6 +250,21 @@ public class MockMicrosoftOidcTestResource extends MockOidcTestResource<MockMicr
                 + "}";
         rc.response()
                 .putHeader("Content-Type", "application/json")
-                .endAndForget(data);
+                .end(data);
+    }
+
+    private void userinfo(RoutingContext rc) {
+        String data = "{\n"
+                + "\"sub\":\"USERID\",\n" +
+                "\"@odata.context\":\"https://substrate.office.com/profileB2/v2.0/me/$metadata#userinfo\",\n"
+                + "\"givenname\":\"Foo\",\n"
+                + "\"familyname\":\"Bar\",\n"
+                + "\"email\":\"microsoft@example.com\",\n"
+                + "\"picture\":\"https://graph.microsoft.com/v1.0/me/photo/$value\"\n"
+                + "}";
+        rc.response()
+                .putHeader("Content-Type", "application/json")
+                .end(data);
+
     }
 }

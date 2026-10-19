@@ -1,4 +1,3 @@
 release:
-  current-version: 1.0.3
-  next-version: 1.0.4-SNAPSHOT
-
+  current-version: 4.0.0
+  next-version: 4.0.1-SNAPSHOT

@@ -1,0 +1,263 @@
+package io.quarkiverse.renarde.security;
+
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.security.Principal;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.core.NewCookie;
+import jakarta.ws.rs.core.NewCookie.SameSite;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.Response.ResponseBuilder;
+
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.eclipse.microprofile.jwt.Claims;
+import org.eclipse.microprofile.jwt.JsonWebToken;
+import org.jboss.logging.Logger;
+
+import io.quarkiverse.renarde.configuration.RenardeConfig;
+import io.quarkiverse.renarde.impl.RenardeConfigBean;
+import io.quarkiverse.renarde.util.Flash;
+import io.quarkiverse.renarde.util.RedirectException;
+import io.quarkiverse.renarde.util.RenardeJWTAuthMechanism;
+import io.quarkus.security.identity.SecurityIdentity;
+import io.smallrye.jwt.build.Jwt;
+import io.vertx.core.http.HttpServerRequest;
+import io.vertx.core.http.HttpServerResponse;
+
+@ApplicationScoped
+public class RenardeSecurity {
+
+    private final static Logger log = Logger.getLogger(RenardeSecurity.class);
+
+    @ConfigProperty(name = "mp.jwt.verify.issuer")
+    String jwtIssuer;
+    @ConfigProperty(name = "mp.jwt.token.cookie")
+    String jwtCookie;
+
+    @ConfigProperty(name = "quarkus.oidc.authentication.cookie-suffix", defaultValue = "q_session")
+    String oidcCookie;
+
+    @ConfigProperty(name = "quarkus.http.root-path", defaultValue = "/")
+    String rootPath;
+
+    @ConfigProperty(name = "quarkus.renarde.auth.redirect.cookie")
+    String locationCookie;
+
+    @ConfigProperty(name = "quarkus.renarde.auth.redirect.type")
+    RenardeConfig.RenardeAuthConfig.Redirect.Type redirectType;
+
+    @Inject
+    HttpServerRequest request;
+
+    @Inject
+    HttpServerResponse response;
+
+    @Inject
+    RenardeConfigBean config;
+
+    @Inject
+    SecurityIdentity identity;
+
+    @Inject
+    RenardeTenantProvider tenantProvider;
+
+    @Inject
+    RenardeUserProvider userProvider;
+
+    @Inject
+    RenardeConfig renardeConfig;
+
+    @Inject
+    HttpHeaders headers;
+
+    @Inject
+    Flash flash;
+
+    public NewCookie makeUserCookie(RenardeUser user) {
+        Set<String> roles = user.roles();
+        String token = Jwt.issuer(jwtIssuer)
+                .upn(user.userId())
+                .groups(roles)
+                .expiresIn(renardeConfig.auth().tokenExpiration())
+                .innerSign().encrypt();
+        // FIXME: expiry, auto-refresh?
+        return new NewCookie.Builder(jwtCookie)
+                .value(token)
+                .path(cookiePath())
+                .sameSite(SameSite.LAX)
+                .httpOnly(true)
+                .build();
+    }
+
+    public RenardeUser getUser() {
+        if (!identity.isAnonymous()) {
+            String authId = getUserId(identity.getPrincipal());
+            String tenantId = tenantProvider.getTenantId();
+            if (tenantId == null) {
+                tenantId = "manual";
+            }
+            RenardeUser user = userProvider.findUser(tenantId, authId);
+            // old cookie, no such user
+            if (user == null) {
+                redirectToLogin("Invalid user: " + authId);
+            }
+            // let's not produce users if we're still registering them, but we must differentiate them
+            // from inexistent users, for which we're triggering a logout, because during registration
+            // we have an OIDC session but the user is not registered yet, so we don't want there to
+            // be a current user, but we also don't want to logout and clear the OIDC session while
+            // we're registering the user
+            if (!user.registered()) {
+                return null;
+            }
+            return user;
+        }
+        return null;
+    }
+
+    public static String getUserId(Principal principal) {
+        if (principal instanceof JsonWebToken) {
+            // we cannot trust its getName() which is not unique
+            JsonWebToken idToken = (JsonWebToken) principal;
+            String authId = idToken.getClaim(Claims.upn.name());
+            // DO NOT use preferred_username which is not unique
+            if (authId == null) {
+                authId = idToken.getClaim(Claims.sub.name());
+            }
+            return authId;
+        } else {
+            // most others should be unique
+            return principal.getName();
+        }
+    }
+
+    public Response makeLogoutResponse() {
+        try {
+            // Use "/" rather than the root-path directly, because Response.seeOther()
+            // already resolves relative URIs against quarkus.http.root-path
+            return this.makeLogoutResponse(new URI("/"));
+        } catch (URISyntaxException e) {
+            // can't happen
+            throw new RuntimeException(e);
+        }
+    }
+
+    public Response makeLogoutResponse(URI redirectUri) {
+        return Response.seeOther(redirectUri).cookie(makeLogoutCookies()).build();
+    }
+
+    public NewCookie[] makeLogoutCookies() {
+        Set<String> tenants = tenantProvider.getTenants();
+        List<NewCookie> cookies = new ArrayList<>(tenants.size() + 1);
+        // Default tenant
+        if (request.getCookie(oidcCookie) != null) {
+            cookies.add(invalidateCookie(oidcCookie));
+        }
+        // Named tenants
+        for (String tenant : tenants) {
+            String cookieName = oidcCookie + "_" + tenant;
+            if (request.getCookie(cookieName) != null) {
+                cookies.add(invalidateCookie(cookieName));
+            }
+        }
+
+        // Manual
+        if (request.getCookie(jwtCookie) != null) {
+            cookies.add(invalidateCookie(jwtCookie));
+        }
+
+        // Remove the redirect cookie (if it exists)
+        if (request.getCookie(renardeConfig.auth().redirect().cookie()) != null) {
+            cookies.add(invalidateCookie(renardeConfig.auth().redirect().cookie()));
+        }
+
+        return cookies.toArray(new NewCookie[0]);
+    }
+
+    public Response makeRedirectAfterLogin(URI uri) {
+        Map<String, jakarta.ws.rs.core.Cookie> cookies = headers.getCookies();
+        jakarta.ws.rs.core.Cookie redirectCookie = cookies.get(renardeConfig.auth().locationCookie());
+        NewCookie newCookie = null;
+        if (redirectCookie != null) {
+            // consume it
+            String value = redirectCookie.getValue();
+            newCookie = invalidateCookie(renardeConfig.auth().locationCookie());
+            uri = URI.create(value);
+        }
+        ResponseBuilder response = Response.seeOther(uri);
+        if (newCookie != null) {
+            response.cookie(newCookie);
+        }
+        return response.build();
+    }
+
+    public void redirectAfterLogin(URI uri) {
+        throw new RedirectException(makeRedirectAfterLogin(uri));
+    }
+
+    public Response makeRedirectToLogin(String message) {
+        if (request.getHeader(jwtCookie) != null && request.uri().equals(config.getLoginPage())) {
+            // this would cause a redirect loop, not sure how to handle, but not by redirecting
+            log.errorf("Redirect loop at %s, giving up on clearing bad JWT cookie", config.getLoginPage());
+            return Response.serverError().build();
+        }
+        // see https://github.com/quarkiverse/quarkus-renarde/issues/194
+        if (response.headers().contains(HttpHeaders.LOCATION)) {
+            // workaround bug where auth challenge sets location header, and we add one, resulting
+            // in there being two, which is invalid HTTP
+            response.headers().remove(HttpHeaders.LOCATION);
+        }
+
+        String redirectUri;
+        boolean locationCookieEnabled = redirectType == RenardeConfig.RenardeAuthConfig.Redirect.Type.cookie;
+        if (locationCookieEnabled) {
+            redirectUri = config.getLoginPage();
+        } else {
+            redirectUri = "%s?%s=%s".formatted(config.getLoginPage(), RenardeJWTAuthMechanism.REDIRECT_URI,
+                    URLEncoder.encode(request.absoluteURI(), StandardCharsets.UTF_8));
+        }
+
+        // Remove any redirect cookie set by the auth challenge (storeInitialLocation in getChallenge),
+        // since saveURICookie() will set it.
+        response.removeCookies(locationCookie, false);
+
+        ResponseBuilder builder = Response.seeOther(URI.create(redirectUri));
+        builder.cookie(makeLogoutCookies());
+        if (locationCookieEnabled)
+            builder.cookie(saveURICookie());
+
+        flash.flash("message", message);
+
+        return builder.build();
+    }
+
+    public void redirectToLogin(String message) {
+        throw new RedirectException(makeRedirectToLogin(message));
+    }
+
+    private NewCookie saveURICookie() {
+        return new NewCookie.Builder(locationCookie).path(cookiePath()).value(request.absoluteURI())
+                .secure(request.isSSL()).build();
+    }
+
+    public NewCookie invalidateCookie(String cookieName) {
+        return new NewCookie.Builder(cookieName).path(cookiePath()).maxAge(0).build();
+    }
+
+    public boolean hasUserCookie() {
+        return request.getCookie(jwtCookie) != null;
+    }
+
+    private String cookiePath() {
+        return renardeConfig.auth().scopeCookiesToRootPath() ? rootPath : "/";
+    }
+
+}

@@ -4,7 +4,7 @@
   <parent>
     <groupId>io.quarkiverse.renarde</groupId>
     <artifactId>quarkus-renarde-parent</artifactId>
-    <version>1.0.4-SNAPSHOT</version>
+    <version>4.0.1-SNAPSHOT</version>
   </parent>
   <artifactId>quarkus-renarde-deployment</artifactId>
   <name>Quarkus - Renarde - Deployment</name>
@@ -27,15 +27,11 @@
     </dependency>
     <dependency>
       <groupId>io.quarkus</groupId>
-      <artifactId>quarkus-resteasy-reactive-deployment</artifactId>
+      <artifactId>quarkus-rest-deployment</artifactId>
     </dependency>
     <dependency>
       <groupId>io.quarkus</groupId>
-      <artifactId>quarkus-resteasy-reactive-qute-deployment</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>io.quarkus</groupId>
-      <artifactId>quarkus-reactive-routes-deployment</artifactId>
+      <artifactId>quarkus-rest-qute-deployment</artifactId>
     </dependency>
     <dependency>
       <groupId>io.quarkus</groupId>
@@ -50,13 +46,39 @@
       <artifactId>quarkus-qute-deployment</artifactId>
     </dependency>
     <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-rest-csrf-deployment</artifactId>
+    </dependency>
+    <dependency>
       <groupId>io.quarkiverse.renarde</groupId>
       <artifactId>quarkus-renarde</artifactId>
       <version>${project.version}</version>
     </dependency>
     <dependency>
       <groupId>io.quarkus</groupId>
-      <artifactId>quarkus-junit5-internal</artifactId>
+      <artifactId>quarkus-junit-internal</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-mailer</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.rest-assured</groupId>
+      <artifactId>rest-assured</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.quarkiverse.renarde</groupId>
+      <artifactId>quarkus-renarde-security</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.quarkiverse.renarde</groupId>
+      <artifactId>quarkus-renarde-test</artifactId>
+      <version>${project.version}</version>
       <scope>test</scope>
     </dependency>
   </dependencies>

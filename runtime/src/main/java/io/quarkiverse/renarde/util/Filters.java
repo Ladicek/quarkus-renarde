@@ -1,53 +1,34 @@
 package io.quarkiverse.renarde.util;
 
-import java.util.Map.Entry;
-
-import javax.inject.Inject;
-import javax.ws.rs.container.ContainerResponseContext;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.Priorities;
+import jakarta.ws.rs.container.ContainerResponseContext;
 
 import org.jboss.resteasy.reactive.server.ServerRequestFilter;
 import org.jboss.resteasy.reactive.server.ServerResponseFilter;
+import org.jboss.resteasy.reactive.server.spi.ResteasyReactiveContainerRequestContext;
 
-import io.quarkus.qute.TemplateInstance;
-import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
 
 public class Filters {
 
     @Inject
-    RenderArgs renderArgs;
-
-    @Inject
     Flash flash;
 
     @Inject
-    CRSF crsf;
+    I18N i18n;
 
-    @ServerRequestFilter(readBody = true)
-    public void filterRequest(HttpServerRequest req) {
+    @ServerRequestFilter
+    public void filterRequest(ResteasyReactiveContainerRequestContext requestContext, HttpServerRequest req) {
         flash.handleFlashCookie();
-        crsf.readCRSFCookie();
-        // check CRSF param for every method except the three safe ones
-        if (req.method() != HttpMethod.GET
-                && req.method() != HttpMethod.HEAD
-                && req.method() != HttpMethod.OPTIONS) {
-            //FIXME: can't do this for now because form values are not read when filter is invoked
-            //            crsf.checkCRSFToken();
-        }
+        i18n.readLanguageCookie(requestContext);
     }
 
-    @ServerResponseFilter
+    // this must run before the Qute response filter
+    @ServerResponseFilter(priority = Priorities.USER + 1000) // sorted in reverse order
     public void filterResponse(ContainerResponseContext responseContext, HttpServerResponse resp) {
-        Object entity = responseContext.getEntity();
-        if (entity instanceof TemplateInstance) {
-            TemplateInstance template = (TemplateInstance) entity;
-            for (Entry<String, Object> entry : renderArgs.entrySet()) {
-                template.data(entry.getKey(), entry.getValue());
-            }
-        }
+        i18n.setLanguageCookie();
         flash.setFlashCookie();
-        crsf.setCRSFCookie();
     }
-
 }

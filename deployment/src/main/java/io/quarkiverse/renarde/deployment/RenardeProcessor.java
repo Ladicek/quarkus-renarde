@@ -1,33 +1,34 @@
 package io.quarkiverse.renarde.deployment;
 
-import java.io.File;
-import java.io.FileWriter;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.reflect.Modifier;
 import java.net.URI;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.KeyPair;
-import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Base64;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
+import java.util.Map.Entry;
 import java.util.Set;
+import java.util.function.Predicate;
+import java.util.stream.Stream;
 
-import javax.enterprise.context.RequestScoped;
-import javax.enterprise.event.Observes;
-import javax.enterprise.inject.Produces;
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import javax.transaction.Transactional;
-import javax.ws.rs.Priorities;
+import jakarta.enterprise.context.RequestScoped;
+import jakarta.enterprise.event.Observes;
+import jakarta.enterprise.inject.Produces;
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.inject.Singleton;
+import jakarta.transaction.Transactional;
+import jakarta.ws.rs.Priorities;
 
 import org.eclipse.microprofile.config.Config;
 import org.eclipse.microprofile.config.ConfigProvider;
@@ -37,6 +38,7 @@ import org.jboss.jandex.AnnotationTarget.Kind;
 import org.jboss.jandex.AnnotationValue;
 import org.jboss.jandex.ClassInfo;
 import org.jboss.jandex.DotName;
+import org.jboss.jandex.IndexView;
 import org.jboss.jandex.MethodInfo;
 import org.jboss.jandex.Type;
 import org.jboss.logging.Logger;
@@ -45,48 +47,68 @@ import org.jboss.resteasy.reactive.common.processor.transformation.AnnotationsTr
 import org.jboss.resteasy.reactive.common.processor.transformation.AnnotationsTransformer.TransformationContext;
 import org.jboss.resteasy.reactive.common.processor.transformation.Transformation;
 import org.jboss.resteasy.reactive.common.util.URLUtils;
+import org.jboss.resteasy.reactive.server.ServerExceptionMapper;
 
 import io.quarkiverse.renarde.Controller;
 import io.quarkiverse.renarde.deployment.ControllerVisitor.ControllerClass;
 import io.quarkiverse.renarde.deployment.ControllerVisitor.ControllerMethod;
 import io.quarkiverse.renarde.deployment.ControllerVisitor.UriPart;
+import io.quarkiverse.renarde.htmx.HxController;
+import io.quarkiverse.renarde.impl.RenardeConfigBean;
+import io.quarkiverse.renarde.impl.RenardeRecorder;
 import io.quarkiverse.renarde.router.Router;
 import io.quarkiverse.renarde.router.RouterMethod;
-import io.quarkiverse.renarde.util.AuthenticationFailedExceptionMapper;
-import io.quarkiverse.renarde.util.CRSF;
 import io.quarkiverse.renarde.util.Filters;
 import io.quarkiverse.renarde.util.Flash;
+import io.quarkiverse.renarde.util.Globals;
+import io.quarkiverse.renarde.util.I18N;
 import io.quarkiverse.renarde.util.JavaExtensions;
 import io.quarkiverse.renarde.util.MyParamConverters;
 import io.quarkiverse.renarde.util.MyValidationInterceptor;
 import io.quarkiverse.renarde.util.QuteResolvers;
-import io.quarkiverse.renarde.util.RandomHolder;
 import io.quarkiverse.renarde.util.RedirectExceptionMapper;
+import io.quarkiverse.renarde.util.RenardeJWTAuthMechanism;
+import io.quarkiverse.renarde.util.RenardeValidationLocaleResolver;
 import io.quarkiverse.renarde.util.RenderArgs;
 import io.quarkiverse.renarde.util.Validation;
 import io.quarkus.arc.Unremovable;
 import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
+import io.quarkus.arc.deployment.AutoAddScopeBuildItem;
+import io.quarkus.arc.deployment.AutoAddScopeBuildItem.MatchPredicate;
+import io.quarkus.arc.deployment.BeanContainerBuildItem;
+import io.quarkus.arc.deployment.BuildTimeConditionBuildItem;
 import io.quarkus.arc.deployment.ExcludedTypeBuildItem;
 import io.quarkus.arc.deployment.GeneratedBeanBuildItem;
 import io.quarkus.arc.deployment.GeneratedBeanGizmoAdaptor;
 import io.quarkus.arc.deployment.UnremovableBeanBuildItem;
-import io.quarkus.bootstrap.workspace.ArtifactSources;
-import io.quarkus.bootstrap.workspace.SourceDir;
+import io.quarkus.arc.processor.BuiltinScope;
+import io.quarkus.bootstrap.classloading.QuarkusClassLoader;
+import io.quarkus.deployment.ApplicationArchive;
 import io.quarkus.deployment.Capabilities;
 import io.quarkus.deployment.Capability;
+import io.quarkus.deployment.IsLocalDevelopment;
 import io.quarkus.deployment.annotations.BuildProducer;
 import io.quarkus.deployment.annotations.BuildStep;
+import io.quarkus.deployment.annotations.ExecutionTime;
+import io.quarkus.deployment.annotations.Record;
 import io.quarkus.deployment.builditem.AdditionalIndexedClassesBuildItem;
+import io.quarkus.deployment.builditem.ApplicationArchivesBuildItem;
+import io.quarkus.deployment.builditem.ApplicationClassPredicateBuildItem;
 import io.quarkus.deployment.builditem.ApplicationIndexBuildItem;
 import io.quarkus.deployment.builditem.BytecodeTransformerBuildItem;
 import io.quarkus.deployment.builditem.CombinedIndexBuildItem;
 import io.quarkus.deployment.builditem.FeatureBuildItem;
+import io.quarkus.deployment.builditem.HotDeploymentWatchedFileBuildItem;
 import io.quarkus.deployment.builditem.LaunchModeBuildItem;
 import io.quarkus.deployment.builditem.RunTimeConfigurationDefaultBuildItem;
+import io.quarkus.deployment.builditem.nativeimage.JniRuntimeAccessBuildItem;
+import io.quarkus.deployment.builditem.nativeimage.NativeImageResourceBuildItem;
+import io.quarkus.deployment.builditem.nativeimage.NativeImageResourceDirectoryBuildItem;
 import io.quarkus.deployment.builditem.nativeimage.RuntimeInitializedClassBuildItem;
+import io.quarkus.deployment.execannotations.ExecutionModelAnnotationsAllowedBuildItem;
 import io.quarkus.deployment.logging.LogCleanupFilterBuildItem;
-import io.quarkus.deployment.pkg.builditem.CurateOutcomeBuildItem;
 import io.quarkus.deployment.util.AsmUtil;
+import io.quarkus.devui.spi.page.CardPageBuildItem;
 import io.quarkus.gizmo.BytecodeCreator;
 import io.quarkus.gizmo.ClassCreator;
 import io.quarkus.gizmo.ClassOutput;
@@ -97,10 +119,17 @@ import io.quarkus.gizmo.MethodCreator;
 import io.quarkus.gizmo.MethodDescriptor;
 import io.quarkus.gizmo.ResultHandle;
 import io.quarkus.hibernate.validator.runtime.jaxrs.ResteasyReactiveEndPointValidationInterceptor;
+import io.quarkus.qute.TemplateInstance;
 import io.quarkus.resteasy.reactive.server.spi.AnnotationsTransformerBuildItem;
 import io.quarkus.resteasy.reactive.spi.AdditionalResourceClassBuildItem;
+import io.quarkus.resteasy.reactive.spi.CustomExceptionMapperBuildItem;
 import io.quarkus.resteasy.reactive.spi.ParamConverterBuildItem;
+import io.quarkus.runtime.LocalesBuildTimeConfig;
 import io.quarkus.runtime.StartupEvent;
+import io.quarkus.smallrye.jwt.deployment.GenerateEncryptedDevModeJwtKeysBuildItem;
+import io.quarkus.smallrye.jwt.deployment.GeneratePersistentDevModeJwtKeysBuildItem;
+import io.quarkus.smallrye.jwt.runtime.auth.JWTAuthMechanism;
+import io.quarkus.vertx.http.deployment.HttpRootPathBuildItem;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 
@@ -114,11 +143,39 @@ public class RenardeProcessor {
     public static final DotName DOTNAME_ROUTER = DotName.createSimple(Router.class.getName());
     public static final DotName DOTNAME_UNREMOVABLE = DotName.createSimple(Unremovable.class.getName());
     public static final DotName DOTNAME_TRANSACTIONAL = DotName.createSimple(Transactional.class.getName());
-    public static final DotName DOTNAME_USER = DotName.createSimple("io.quarkiverse.renarde.oidc.RenardeUser");
-    public static final DotName DOTNAME_SECURITY = DotName.createSimple("io.quarkiverse.renarde.oidc.RenardeSecurity");
+    public static final DotName DOTNAME_USER = DotName.createSimple("io.quarkiverse.renarde.security.RenardeUser");
+    public static final DotName DOTNAME_USER_WITH_PASSWORD = DotName
+            .createSimple("io.quarkiverse.renarde.security.RenardeUserWithPassword");
+    public static final DotName DOTNAME_SECURITY = DotName.createSimple("io.quarkiverse.renarde.security.RenardeSecurity");
+    public static final DotName DOTNAME_AUTHENTICATION_HANDLER = DotName
+            .createSimple("io.quarkiverse.renarde.security.impl.AuthenticationFailedExceptionMapper");
+    public static final DotName DOTNAME_RENARDE_FORM_LOGIN_CONTROLLER = DotName
+            .createSimple("io.quarkiverse.renarde.security.impl.RenardeFormLoginController");
+    public static final DotName DOTNAME_RENARDE_SECURITY_CONTROLLER = DotName
+            .createSimple("io.quarkiverse.renarde.security.impl.RenardeSecurityController");
+
+    public static final DotName DOTNAME_HX_CONTROLLER = DotName.createSimple(HxController.class.getName());
+    public static final DotName DOTNAME_LOGIN_PAGE = DotName.createSimple("io.quarkiverse.renarde.security.LoginPage");
     public static final DotName DOTNAME_NAMED = DotName.createSimple(Named.class.getName());
+    public static final DotName DOTNAME_TEMPLATE_INSTANCE = DotName.createSimple(TemplateInstance.class.getName());
 
     private static final String FEATURE = "renarde";
+
+    private static final String[] OPENHTMLTOPDF_NATIVE_RUNTIME = new String[] {
+            // This causes the pdfbox to log at static init time, which creates a JUL which is forbidden
+            "com.openhtmltopdf.resource.FSEntityResolver",
+            // These call java/awt stuff at static init, which may initialise Java2D
+            "com.openhtmltopdf.java2d.image.AWTFSImage",
+            "com.openhtmltopdf.java2d.image.AWTFSImage$NullImage",
+            "com.openhtmltopdf.pdfboxout.PdfBoxFastOutputDevice",
+            // This one initialises fonts at build time
+            "com.openhtmltopdf.pdfboxout.fontstore.AbstractFontStore$BuiltinFontStore",
+    };
+    private static final String PDFBOX_PROBLEMATIC_CLASS = "org.apache.pdfbox.pdmodel.encryption.PublicKeySecurityHandler";
+    private static final String PDF_RESPONSE_HANDLER_CLASS = "io.quarkiverse.renarde.pdf.runtime.PdfResponseHandler";
+
+    private static final String[] SUPPORTED_OIDC_PROVIDERS = new String[] { "facebook", "apple", "github", "microsoft",
+            "google", "twitter", "spotify" };
 
     @BuildStep
     FeatureBuildItem feature() {
@@ -126,8 +183,33 @@ public class RenardeProcessor {
     }
 
     @BuildStep
-    RuntimeInitializedClassBuildItem cryptoConfiguration() {
-        return new RuntimeInitializedClassBuildItem(RandomHolder.class.getCanonicalName());
+    void setupPdfBox(BuildProducer<RuntimeInitializedClassBuildItem> runtimeInitializedClassBuildItem,
+            BuildProducer<NativeImageResourceBuildItem> nativeImageResourceBuildItem,
+            BuildProducer<NativeImageResourceDirectoryBuildItem> resource,
+            BuildProducer<JniRuntimeAccessBuildItem> jniRuntimeAccessBuildItem) {
+        // If we have the renarde-pdf module, we'll see this class
+        if (QuarkusClassLoader.isClassPresentAtRuntime(PDF_RESPONSE_HANDLER_CLASS)) {
+            // This one needs to be initialised at runtime on jdk21/graalvm 23.1 because setting the logger starts the java2d disposer thread
+            runtimeInitializedClassBuildItem.produce(new RuntimeInitializedClassBuildItem(PDF_RESPONSE_HANDLER_CLASS));
+            for (String klass : OPENHTMLTOPDF_NATIVE_RUNTIME) {
+                runtimeInitializedClassBuildItem
+                        .produce(new RuntimeInitializedClassBuildItem(klass));
+            }
+            // These are needed at runtime for native image for openhtmltopdf
+            nativeImageResourceBuildItem.produce(
+                    new NativeImageResourceBuildItem(List.of("resources/css/XhtmlNamespaceHandler.css",
+                            "resources/schema/openhtmltopdf/catalog-special.xml",
+                            "resources/schema/openhtmltopdf/char-entities-xhtml-only.ent",
+                            "resources/schema/openhtmltopdf/char-entities-xhtml-mathml.ent")));
+            resource.produce(new NativeImageResourceDirectoryBuildItem("org/apache/pdfbox/resources/ttf"));
+            // XToolkit native code calls FindClass("java/lang/Thread") — without
+            // this registration, the AWT-XAWT thread crashes with NoClassDefFoundError,
+            // corrupting AWT state and preventing the Java2D Disposer from cleaning
+            // up BufImgSurfaceData weak JNI global refs
+            jniRuntimeAccessBuildItem
+                    .produce(new JniRuntimeAccessBuildItem(true, true, true, "java.lang.Thread"));
+
+        }
     }
 
     @BuildStep
@@ -154,26 +236,21 @@ public class RenardeProcessor {
             // this allows me to create an exception mapper for auth failures (expired token, invalid user)
             // even with this I can't use an exception mapper apparently, but need to register a reactive route
             defineUnlessPresent("quarkus.http.auth.proactive", "false", config, runtimeConfigurationBuildItem);
-            // not sure this one matters, just has to be set to any value AFAICT
-            defineUnlessPresent("mp.jwt.verify.issuer", "https://example.com/issuer", config, runtimeConfigurationBuildItem);
             // those are the better defaults
             defineUnlessPresent("mp.jwt.token.header", "Cookie", config, runtimeConfigurationBuildItem);
             defineUnlessPresent("mp.jwt.token.cookie", "QuarkusUser", config, runtimeConfigurationBuildItem);
         }
         // Apparently, no OIDC capability to check
-        for (String provider : Arrays.asList("facebook", "apple", "github", "microsoft", "google", "twitter")) {
-            if ((config.getOptionalValue("quarkus.oidc." + provider + ".provider", String.class).isPresent()
-                    || config.getOptionalValue("quarkus.oidc." + provider + ".client-id", String.class).isPresent())
+        for (String provider : SUPPORTED_OIDC_PROVIDERS) {
+            if (config.getOptionalValue("quarkus.oidc." + provider + ".tenant-enabled", Boolean.class).orElse(true) &&
+                    (config.getOptionalValue("quarkus.oidc." + provider + ".provider", String.class).isPresent()
+                            || config.getOptionalValue("quarkus.oidc." + provider + ".client-id", String.class).isPresent())
                     && !config.getOptionalValue("quarkus.oidc." + provider + ".authentication.redirect-path", String.class)
                             .isPresent()) {
-                String target = "oidc-success";
-                if (provider.equals("github") || provider.equals("twitter")) {
-                    target = provider + "-success";
-                }
                 runtimeConfigurationBuildItem
                         .produce(new RunTimeConfigurationDefaultBuildItem(
                                 "quarkus.oidc." + provider + ".authentication.redirect-path",
-                                "/_renarde/security/" + target));
+                                "/_renarde/security/oidc-success"));
             }
         }
     }
@@ -186,119 +263,82 @@ public class RenardeProcessor {
         }
     }
 
+    // This is now handled by Quarkus Core, with build-item-based customisations
     @BuildStep
-    void setupJWT(LaunchModeBuildItem launchMode, Capabilities capabilities,
-            BuildProducer<RunTimeConfigurationDefaultBuildItem> runtimeConfigurationBuildItem,
-            CurateOutcomeBuildItem curateOutcomeBuildItem)
-            throws IOException, NoSuchAlgorithmException {
-        if (launchMode.getLaunchMode().isDevOrTest()
-                && capabilities.isPresent(Capability.JWT)) {
-            // make sure we have minimal config
-            final Config config = ConfigProvider.getConfig();
-
-            // PRIVATE
-            Optional<String> decryptKeyLocationOpt = config.getOptionalValue("mp.jwt.decrypt.key.location", String.class);
-            Optional<String> signKeyLocationOpt = config.getOptionalValue("smallrye.jwt.sign.key.location", String.class);
-            // PUBLIC
-            Optional<String> verifyKeyLocationOpt = config.getOptionalValue("mp.jwt.verify.publickey.location", String.class);
-            Optional<String> encryptKeyLocationOpt = config.getOptionalValue("smallrye.jwt.encrypt.key.location", String.class);
-            if (!decryptKeyLocationOpt.isPresent()
-                    && !signKeyLocationOpt.isPresent()
-                    && !verifyKeyLocationOpt.isPresent()
-                    && !encryptKeyLocationOpt.isPresent()) {
-                // FIXME: folder
-
-                File buildDir = null;
-                ArtifactSources src = curateOutcomeBuildItem.getApplicationModel().getAppArtifact().getSources();
-                if (src != null) { // shouldn't be null in dev mode
-                    Collection<SourceDir> srcDirs = src.getResourceDirs();
-                    if (srcDirs.isEmpty()) {
-                        // in the module has no resources dir?
-                        srcDirs = src.getSourceDirs();
-                    }
-                    if (!srcDirs.isEmpty()) {
-                        // pick the first resources output dir
-                        Path resourcesOutputDir = srcDirs.iterator().next().getOutputDir();
-                        buildDir = resourcesOutputDir.toFile();
-                    }
-                }
-                if (buildDir == null) {
-                    // the module doesn't have any sources nor resources, stick to the build dir
-                    buildDir = new File(
-                            curateOutcomeBuildItem.getApplicationModel().getAppArtifact().getWorkspaceModule().getBuildDir(),
-                            "classes");
-                }
-
-                buildDir.mkdirs();
-                File privateKey = new File(buildDir, "dev.privateKey.pem");
-                File publicKey = new File(buildDir, "dev.publicKey.pem");
-                if (!privateKey.exists() && !publicKey.exists()) {
-                    KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
-                    kpg.initialize(2048);
-                    KeyPair kp = kpg.generateKeyPair();
-
-                    logger.infof("Generating private/public keys for DEV/TEST in %s and %s", privateKey, publicKey);
-                    try (FileWriter fw = new FileWriter(privateKey)) {
-                        fw.append("-----BEGIN PRIVATE KEY-----\n");
-                        fw.append(Base64.getMimeEncoder().encodeToString(kp.getPrivate().getEncoded()));
-                        fw.append("\n");
-                        fw.append("-----END PRIVATE KEY-----\n");
-                    }
-                    try (FileWriter fw = new FileWriter(publicKey)) {
-                        fw.append("-----BEGIN PUBLIC KEY-----\n");
-                        fw.append(Base64.getMimeEncoder().encodeToString(kp.getPublic().getEncoded()));
-                        fw.append("\n");
-                        fw.append("-----END PUBLIC KEY-----\n");
-                    }
-                }
-                runtimeConfigurationBuildItem
-                        .produce(new RunTimeConfigurationDefaultBuildItem("mp.jwt.decrypt.key.location", privateKey.getName()));
-                runtimeConfigurationBuildItem.produce(
-                        new RunTimeConfigurationDefaultBuildItem("smallrye.jwt.sign.key.location", privateKey.getName()));
-                runtimeConfigurationBuildItem.produce(
-                        new RunTimeConfigurationDefaultBuildItem("mp.jwt.verify.publickey.location", publicKey.getName()));
-                runtimeConfigurationBuildItem.produce(
-                        new RunTimeConfigurationDefaultBuildItem("smallrye.jwt.encrypt.key.location", publicKey.getName()));
-            }
-        }
+    void generatePersistendJwtTokensInDevMode(
+            BuildProducer<GeneratePersistentDevModeJwtKeysBuildItem> generatePersistentDevModeJwtKeysBuildItemBuildProducer,
+            BuildProducer<GenerateEncryptedDevModeJwtKeysBuildItem> generateEncryptedDevModeJwtKeysBuildItemBuildProducer) {
+        generatePersistentDevModeJwtKeysBuildItemBuildProducer.produce(new GeneratePersistentDevModeJwtKeysBuildItem());
+        generateEncryptedDevModeJwtKeysBuildItemBuildProducer.produce(new GenerateEncryptedDevModeJwtKeysBuildItem());
     }
 
     @BuildStep
     void produceBeans(BuildProducer<AdditionalBeanBuildItem> additionalBeanBuildItems,
             BuildProducer<ParamConverterBuildItem> paramConverterBuildItems,
-            BuildProducer<AdditionalIndexedClassesBuildItem> additionalIndexedClassesBuildItems) {
+            BuildProducer<AdditionalIndexedClassesBuildItem> additionalIndexedClassesBuildItems,
+            BuildProducer<ApplicationClassPredicateBuildItem> applicationClassPredicateBuildItems) {
+        additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(Globals.class));
         additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(Filters.class));
         additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(QuteResolvers.class));
-        additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(CRSF.class));
         additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(Flash.class));
+        additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(I18N.class));
         additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(RenderArgs.class));
         additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(Validation.class));
+        additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(RenardeValidationLocaleResolver.class));
         additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(JavaExtensions.class));
         additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(MyValidationInterceptor.class));
-        additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(AuthenticationFailedExceptionMapper.class));
+        additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(RenardeJWTAuthMechanism.class));
+        additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(RenardeConfigBean.class));
+        // If we have the renarde-security module, we'll see this class
+        if (QuarkusClassLoader.isClassPresentAtRuntime(DOTNAME_AUTHENTICATION_HANDLER.toString())) {
+            additionalBeanBuildItems.produce(AdditionalBeanBuildItem.unremovableOf(DOTNAME_AUTHENTICATION_HANDLER.toString()));
+        }
 
         paramConverterBuildItems.produce(new ParamConverterBuildItem(MyParamConverters.class.getName(), Priorities.USER, true));
 
         additionalIndexedClassesBuildItems.produce(
-                new AdditionalIndexedClassesBuildItem(Filters.class.getName(), RedirectExceptionMapper.class.getName()));
+                new AdditionalIndexedClassesBuildItem(Filters.class.getName(), RedirectExceptionMapper.class.getName(),
+                        Controller.class.getName(), HxController.class.getName()));
 
+        /*
+         * We don't have these beans, but they are endpoints, and they can't be declared FWK classes, otherwise
+         * config changes will not reload them. And config changes may affect the number of interceptors declared
+         * on beans, thus causing NoSuchMethodError because we generate bean proxy/client methods that take one
+         * parameter per interceptor.
+         */
+        applicationClassPredicateBuildItems.produce(new ApplicationClassPredicateBuildItem(new Predicate<String>() {
+            @Override
+            public boolean test(String t) {
+                return DOTNAME_RENARDE_SECURITY_CONTROLLER.toString('.').equals(t)
+                        || DOTNAME_RENARDE_FORM_LOGIN_CONTROLLER.toString('.').equals(t);
+            }
+        }));
     }
 
-    // Doesn't work yet
-    //    @BuildStep
-    //    void registerCustomExceptionMappers(BuildProducer<CustomExceptionMapperBuildItem> customExceptionMapper) {
-    //        customExceptionMapper.produce(new CustomExceptionMapperBuildItem(AuthenticationFailedExceptionMapper.class.getName()));
-    //    }
-    //
+    @BuildStep
+    void registerCustomExceptionMappers(BuildProducer<CustomExceptionMapperBuildItem> customExceptionMapper) {
+        // If we have the renarde-security module, we'll see this class
+        if (QuarkusClassLoader.isClassPresentAtRuntime(DOTNAME_AUTHENTICATION_HANDLER.toString())) {
+            customExceptionMapper.produce(new CustomExceptionMapperBuildItem(DOTNAME_AUTHENTICATION_HANDLER.toString()));
+        }
+    }
+
     @BuildStep
     ExcludedTypeBuildItem removeOriginalValidatorInterceptor() {
         return new ExcludedTypeBuildItem(ResteasyReactiveEndPointValidationInterceptor.class.getName());
     }
 
     @BuildStep
+    ExcludedTypeBuildItem removeOriginalJWTAuthMechanism() {
+        return new ExcludedTypeBuildItem(JWTAuthMechanism.class.getName());
+    }
+
+    @BuildStep
     void produceUserInRequestScope(ApplicationIndexBuildItem indexBuildItem,
             BuildProducer<GeneratedBeanBuildItem> generatedBeans) {
         Set<ClassInfo> users = indexBuildItem.getIndex().getAllKnownImplementors(DOTNAME_USER);
+        // not sure why I need to do this, but if I don't, I get zero user implementors
+        users.addAll(indexBuildItem.getIndex().getAllKnownImplementors(DOTNAME_USER_WITH_PASSWORD));
         if (users.isEmpty())
             return;
         if (users.size() > 2) {
@@ -350,22 +390,34 @@ public class RenardeProcessor {
 
     @BuildStep
     void collectControllers(CombinedIndexBuildItem indexBuildItem,
+            List<ExcludedControllerBuildItem> excludedControllerBuildItems,
             BuildProducer<AdditionalResourceClassBuildItem> additionalResourceClassBuildItems,
             BuildProducer<AnnotationsTransformerBuildItem> annotationTransformerBuildItems,
             BuildProducer<io.quarkus.arc.deployment.AnnotationsTransformerBuildItem> arcTransformers,
             BuildProducer<UnremovableBeanBuildItem> unremovableBeans,
             BuildProducer<BytecodeTransformerBuildItem> bytecodeTransformers,
-            BuildProducer<GeneratedBeanBuildItem> generatedBeans) {
+            BuildProducer<GeneratedBeanBuildItem> generatedBeans,
+            BuildProducer<LoginPageBuildItem> loginPageBuildItem,
+            BuildProducer<ExecutionModelAnnotationsAllowedBuildItem> executionModelAnnotationsAllowedBuildItems,
+            BuildProducer<AutoAddScopeBuildItem> autoAddScopeBuildItems) {
+        Set<DotName> excludedControllers = new HashSet<>();
+        for (ExcludedControllerBuildItem excludedControllerBuildItem : excludedControllerBuildItems) {
+            excludedControllers.add(excludedControllerBuildItem.excludedClass);
+        }
         Set<DotName> controllers = new HashSet<>();
         Map<String, ControllerVisitor.ControllerClass> methodsByClass = new HashMap<>();
         for (ClassInfo controllerInfo : indexBuildItem.getIndex().getAllKnownSubclasses(DOTNAME_CONTROLLER)) {
+            // skip excluded controllers
+            if (excludedControllers.contains(controllerInfo.name())) {
+                continue;
+            }
             controllers.add(controllerInfo.name());
             // do not register abstract controllers as beans or resources
             if (!Modifier.isAbstract(controllerInfo.flags())) {
                 additionalResourceClassBuildItems.produce(new AdditionalResourceClassBuildItem(controllerInfo, ""));
                 unremovableBeans.produce(UnremovableBeanBuildItem.beanTypes(controllerInfo.name()));
             }
-            methodsByClass.put(controllerInfo.name().toString(), scanController(controllerInfo));
+            methodsByClass.put(controllerInfo.name().toString(), scanController(controllerInfo, loginPageBuildItem));
         }
         for (DotName controller : controllers) {
             bytecodeTransformers
@@ -384,17 +436,21 @@ public class RenardeProcessor {
         annotationTransformerBuildItems.produce(new AnnotationsTransformerBuildItem(
                 AnnotationsTransformer.builder().appliesTo(Kind.CLASS).transform(ti -> transformController(ti, controllers))));
 
+        autoAddScopeBuildItems.produce(AutoAddScopeBuildItem.builder()
+                .defaultScope(BuiltinScope.REQUEST)
+                .match(new MatchPredicate() {
+                    @Override
+                    public boolean test(ClassInfo klass, Collection<AnnotationInstance> annotations, IndexView index) {
+                        return !klass.isInterface()
+                                && !Modifier.isAbstract(klass.flags())
+                                && controllers.contains(klass.name());
+                    }
+                }).build());
+
         arcTransformers.produce(new io.quarkus.arc.deployment.AnnotationsTransformerBuildItem(
                 new io.quarkus.arc.processor.AnnotationsTransformer() {
                     @Override
                     public void transform(TransformationContext transformationContext) {
-                        if (transformationContext.isClass()
-                                && !Modifier.isAbstract(transformationContext.getTarget().asClass().flags())
-                                && controllers.contains(transformationContext.getTarget().asClass().name())) {
-                            // FIXME: probably don't add a scope annotation if it has one already?
-                            transformationContext.transform().add(ResteasyReactiveDotNames.REQUEST_SCOPED)
-                                    .done();
-                        }
                         if (transformationContext.isMethod()) {
                             MethodInfo method = transformationContext.getTarget().asMethod();
                             if (controllers.contains(method.declaringClass().name())
@@ -402,11 +458,22 @@ public class RenardeProcessor {
                                     && !isAsync(method.returnType())
                                     && (method.hasAnnotation(ResteasyReactiveDotNames.POST)
                                             || method.hasAnnotation(ResteasyReactiveDotNames.PUT)
-                                            || method.hasAnnotation(ResteasyReactiveDotNames.DELETE))) {
+                                            || method.hasAnnotation(ResteasyReactiveDotNames.DELETE)
+                                            || method.hasAnnotation(ResteasyReactiveDotNames.PATCH))) {
                                 transformationContext.transform().add(DOTNAME_TRANSACTIONAL)
                                         .done();
                             }
                         }
+                    }
+                }));
+
+        // Make sure the @Blocking annotation checker sees our endpoints, because it's not using the annotation transformer
+        executionModelAnnotationsAllowedBuildItems
+                .produce(new ExecutionModelAnnotationsAllowedBuildItem(new Predicate<MethodInfo>() {
+                    @Override
+                    public boolean test(MethodInfo method) {
+                        return isControllerMethod(method)
+                                && controllers.contains(method.declaringClass().name());
                     }
                 }));
 
@@ -431,15 +498,23 @@ public class RenardeProcessor {
 
             try (MethodCreator methodCreator = beanClassCreator.getMethodCreator("init", void.class, StartupEvent.class)) {
                 methodCreator.getParameterAnnotations(0).addAnnotation(Observes.class);
+                methodCreator.invokeStaticMethod(
+                        MethodDescriptor.ofMethod(Router.class, "clearRoutes", void.class));
                 for (ControllerClass controllerClass : methodsByClass.values()) {
                     // do not register routes for abstract controllers
                     if (controllerClass.isAbstract) {
                         continue;
                     }
                     String simpleControllerName = controllerClass.className;
+                    // strip package
                     int lastDot = simpleControllerName.lastIndexOf('.');
                     if (lastDot != -1) {
                         simpleControllerName = simpleControllerName.substring(lastDot + 1);
+                    }
+                    // strip outer classes
+                    int lastDollar = simpleControllerName.lastIndexOf('$');
+                    if (lastDollar != -1) {
+                        simpleControllerName = simpleControllerName.substring(lastDollar + 1);
                     }
                     // register all methods for this controller, including super methods, but on this controller name
                     for (ControllerMethod method : controllerClass.getMethods(methodsByClass).values()) {
@@ -465,27 +540,16 @@ public class RenardeProcessor {
         }
     }
 
-    private ControllerVisitor.ControllerClass scanController(ClassInfo controllerInfo) {
+    private ControllerVisitor.ControllerClass scanController(ClassInfo controllerInfo,
+            BuildProducer<LoginPageBuildItem> loginPageBuildItem) {
         Map<String, ControllerMethod> methods = new HashMap<>();
         for (MethodInfo method : controllerInfo.methods()) {
             if (!isControllerMethod(method))
                 continue;
             List<UriPart> parts = new ArrayList<>();
 
-            AnnotationInstance classPath = method.declaringClass().classAnnotation(ResteasyReactiveDotNames.PATH);
-            String className = method.declaringClass().simpleName();
-            String classPathValue = classPath != null ? classPath.value().value().toString() : className;
-
-            AnnotationInstance methodPath = method.annotation(ResteasyReactiveDotNames.PATH);
-            String methodPathValue = methodPath != null ? methodPath.value().value().toString() : method.name();
-
-            String path = classPathValue + (methodPathValue.startsWith("/") ? "" : "/") + methodPathValue;
-
-            // path annotations
-            if (!methodPathValue.startsWith("/")) {
-                parts.add(new ControllerVisitor.StaticUriPart(classPathValue));
-            }
-            parts.add(new ControllerVisitor.StaticUriPart(methodPathValue));
+            String path = getMethodPath(controllerInfo, method);
+            parts.add(new ControllerVisitor.StaticUriPart(path));
 
             // collect declared path params
             Set<String> pathParameters = new HashSet<>();
@@ -495,7 +559,7 @@ public class RenardeProcessor {
             Map<DotName, AnnotationInstance>[] parameterAnnotations = getParameterAnnotations(method);
 
             // look for undeclared path params
-            for (int paramIndex = 0, asmParamIndex = 1; paramIndex < method.parameters().size(); ++paramIndex) {
+            for (int paramIndex = 0, asmParamIndex = 1; paramIndex < method.parametersCount(); ++paramIndex) {
                 String paramName = method.parameterName(paramIndex);
                 AnnotationInstance pathParam = parameterAnnotations[paramIndex].get(ResteasyReactiveDotNames.PATH_PARAM);
                 if (pathParam != null) {
@@ -528,16 +592,50 @@ public class RenardeProcessor {
                         name = paramName;
                     parts.add(new ControllerVisitor.QueryParamUriPart(name, paramIndex, asmParamIndex));
                 }
-                asmParamIndex += AsmUtil.getParameterSize(method.parameters().get(paramIndex));
+                asmParamIndex += AsmUtil.getParameterSize(method.parameterType(paramIndex));
             }
 
-            String descriptor = AsmUtil.getDescriptor(method, v -> v);
+            if (method.hasAnnotation(DOTNAME_LOGIN_PAGE)) {
+                loginPageBuildItem.produce(new LoginPageBuildItem(parts));
+            }
+
+            String descriptor = method.descriptor();
             String key = method.name() + "/" + descriptor;
             methods.put(key, new ControllerMethod(method.name(), descriptor, parts,
-                    method.parameters()));
+                    method.parameterTypes()));
         }
         return new ControllerVisitor.ControllerClass(controllerInfo.name().toString(), controllerInfo.superName().toString(),
                 Modifier.isAbstract(controllerInfo.flags()), methods);
+    }
+
+    private String getMethodPath(ClassInfo controllerInfo, MethodInfo method) {
+        AnnotationInstance classPath = method.declaringClass().declaredAnnotation(ResteasyReactiveDotNames.PATH);
+        String className = method.declaringClass().simpleName();
+        String classPathValue = classPath != null ? classPath.value().value().toString() : null;
+
+        AnnotationInstance methodPath = method.annotation(ResteasyReactiveDotNames.PATH);
+        String methodPathValue = methodPath != null ? methodPath.value().value().toString() : method.name();
+
+        if (classPathValue == null) {
+            // defaults to className, unless method part is absolute
+            if (methodPathValue.startsWith("/")) {
+                return methodPathValue;
+            }
+            classPathValue = className;
+        }
+
+        if (classPathValue.equals("/")) {
+            classPathValue = "";
+        } else if (!classPathValue.isEmpty() && !classPathValue.startsWith("/")) {
+            classPathValue = "/" + classPathValue;
+        }
+        boolean needsSeparator = !classPathValue.endsWith("/") && !methodPathValue.startsWith("/");
+        String ret = classPathValue + (needsSeparator ? "/" : "") + methodPathValue;
+        // strip last / if it's not the root uri
+        if (ret.length() > 1 && ret.endsWith("/")) {
+            ret = ret.substring(0, ret.length() - 1);
+        }
+        return ret;
     }
 
     private boolean isControllerMethod(MethodInfo method) {
@@ -546,14 +644,21 @@ public class RenardeProcessor {
                 && !Modifier.isNative(method.flags())
                 && !Modifier.isStatic(method.flags())
                 && !method.name().equals("<init>")
-                && !method.name().equals("<clinit>");
+                && !method.name().equals("<clinit>")
+                && !method.hasDeclaredAnnotation(ServerExceptionMapper.class);
     }
 
     private void transformController(TransformationContext ti, Set<DotName> controllers) {
         ClassInfo klass = ti.getTarget().asClass();
         if (controllers.contains(klass.name()) && !Modifier.isAbstract(klass.flags())) {
-            if (klass.classAnnotation(ResteasyReactiveDotNames.PATH) == null) {
-                ti.transform().add(ResteasyReactiveDotNames.PATH, AnnotationValue.createStringValue("value", "")).done();
+            /*
+             * Note that we can't change the class @Path annotation, since RR doesn't use AnnotationTransformer for class path
+             * scanning.
+             */
+            if (klass.declaredAnnotation(ResteasyReactiveDotNames.PATH) == null) {
+                ti.transform()
+                        .add(ResteasyReactiveDotNames.PATH, AnnotationValue.createStringValue("value", ""))
+                        .done();
             }
         }
     }
@@ -565,35 +670,23 @@ public class RenardeProcessor {
         }
         if (controllers.contains(method.declaringClass().name())) {
             /*
-             * @Path("foo") class Class { @Path("bar") method(); } -> no change
-             *
-             * @Path("foo") class Class { method(); } -> @Path("foo") class Class { @Path("method") method(); }
-             * class Class { @Path("/bar") method(); } -> @Path("") class Class { @Path("/bar") method(); }
-             * class Class { @Path("bar") method(); } -> @Path("") class Class { @Path("Class/bar") method(); }
-             * class Class { method(); } -> @Path("") class Class { @Path("Class/method") method(); }
+             * If the class path is not specified, collect both class path and method path and convert to a method path alone
+             * Note that we can't change the class @Path annotation, since RR doesn't use AnnotationTransformer for class path
+             * scanning.
              */
-            // class @Path or class name first
-            AnnotationInstance classPath = method.declaringClass().classAnnotation(ResteasyReactiveDotNames.PATH);
-            String className = method.declaringClass().simpleName();
-            String classPathValue = classPath != null ? classPath.value().value().toString() : className;
-
-            AnnotationInstance methodPath = method.annotation(ResteasyReactiveDotNames.PATH);
-            String methodPathValue = methodPath != null ? methodPath.value().value().toString() : method.name();
-
-            String path = classPathValue + (methodPathValue.startsWith("/") ? "" : "/") + methodPathValue;
-
-            String newMethodPathValue = methodPathValue;
+            AnnotationInstance classPath = method.declaringClass().declaredAnnotation(ResteasyReactiveDotNames.PATH);
+            String path = getMethodPath(method.declaringClass(), method);
+            AnnotationInstance methodPath = method.declaredAnnotation(ResteasyReactiveDotNames.PATH);
+            String methodPathValue;
             boolean setMethodPath = false;
-
-            if (classPath != null && methodPath == null) {
-                // can remain the method name
+            if (classPath == null) {
+                methodPathValue = path;
                 setMethodPath = true;
-            } else if (classPath == null) {
-                if (methodPath == null || !methodPathValue.startsWith("/")) {
-                    // prepend the class name
-                    setMethodPath = true;
-                    newMethodPathValue = className + "/" + methodPathValue;
-                }
+            } else if (methodPath != null) {
+                methodPathValue = methodPath.value().value().toString();
+            } else {
+                methodPathValue = method.name();
+                setMethodPath = true;
             }
 
             // collect declared path params
@@ -604,22 +697,23 @@ public class RenardeProcessor {
             Map<DotName, AnnotationInstance>[] parameterAnnotations = getParameterAnnotations(method);
 
             // look for undeclared path params
-            for (int paramPos = 0; paramPos < method.parameters().size(); ++paramPos) {
+            for (int paramPos = 0; paramPos < method.parametersCount(); ++paramPos) {
                 if ((parameterAnnotations[paramPos].get(ResteasyReactiveDotNames.PATH_PARAM) != null
                         || parameterAnnotations[paramPos].get(ResteasyReactiveDotNames.REST_PATH_PARAM) != null)
                         && !pathParameters.contains(method.parameterName(paramPos))) {
                     // add them to the method path
+                    methodPathValue += "/{" + method.parameterName(paramPos) + "}";
                     setMethodPath = true;
-                    newMethodPathValue += "/{" + method.parameterName(paramPos) + "}";
                 }
             }
 
             if (setMethodPath) {
                 Transformation transform = ti.transform();
-                if (methodPathValue != null)
+                if (methodPath != null) {
                     transform.remove(ai -> ai.name().equals(ResteasyReactiveDotNames.PATH));
-                transform.add(ResteasyReactiveDotNames.PATH, AnnotationValue.createStringValue("value", newMethodPathValue))
-                        .done();
+                }
+                transform.add(ResteasyReactiveDotNames.PATH, AnnotationValue.createStringValue("value", methodPathValue));
+                transform.done();
             }
 
             // FIXME: doesn't work for custom Http methods, whatever
@@ -628,7 +722,8 @@ public class RenardeProcessor {
                     && !method.hasAnnotation(ResteasyReactiveDotNames.POST)
                     && !method.hasAnnotation(ResteasyReactiveDotNames.HEAD)
                     && !method.hasAnnotation(ResteasyReactiveDotNames.OPTIONS)
-                    && !method.hasAnnotation(ResteasyReactiveDotNames.DELETE)) {
+                    && !method.hasAnnotation(ResteasyReactiveDotNames.DELETE)
+                    && !method.hasAnnotation(ResteasyReactiveDotNames.PATCH)) {
                 ti.transform().add(ResteasyReactiveDotNames.GET).done();
             }
         }
@@ -636,8 +731,9 @@ public class RenardeProcessor {
 
     private Map<DotName, AnnotationInstance>[] getParameterAnnotations(MethodInfo method) {
         // collect param annotations
-        Map<DotName, AnnotationInstance>[] parameterAnnotations = new Map[method.parameters().size()];
-        for (int paramPos = 0; paramPos < method.parameters().size(); ++paramPos) {
+        @SuppressWarnings("unchecked")
+        Map<DotName, AnnotationInstance>[] parameterAnnotations = new Map[method.parametersCount()];
+        for (int paramPos = 0; paramPos < method.parametersCount(); ++paramPos) {
             parameterAnnotations[paramPos] = new HashMap<>();
         }
         for (AnnotationInstance i : method.annotations()) {
@@ -647,4 +743,166 @@ public class RenardeProcessor {
         }
         return parameterAnnotations;
     }
+
+    @BuildStep
+    void removeHxController(BuildProducer<ExcludedControllerBuildItem> excludedControllerBuildItems) {
+        excludedControllerBuildItems.produce(new ExcludedControllerBuildItem(DOTNAME_HX_CONTROLLER));
+    }
+
+    @BuildStep
+    void removeLoginControllerIfNoUserWithPassword(CombinedIndexBuildItem indexBuildItem,
+            BuildProducer<ExcludedControllerBuildItem> excludedControllerBuildItems,
+            BuildProducer<ExcludedTypeBuildItem> excludedTypeBuildItems,
+            BuildProducer<BuildTimeConditionBuildItem> buildTimeConditionBuildItems) {
+        // we can't support this controller unless we have an implementation of RenardeUserWithPassword
+        // but we also disable this if the user has his own @LoginPage, because it's redundant
+        if (indexBuildItem.getIndex().getAllKnownImplementors(DOTNAME_USER_WITH_PASSWORD).isEmpty()
+                // There is always 1 in DOTNAME_RENARDE_FORM_LOGIN_CONTROLLER, which we ignore if the user has another one
+                || indexBuildItem.getIndex().getAnnotations(DOTNAME_LOGIN_PAGE).size() > 1) {
+            // for Renarde
+            excludedControllerBuildItems.produce(new ExcludedControllerBuildItem(DOTNAME_RENARDE_FORM_LOGIN_CONTROLLER));
+            // for RESTEasy Reactive
+            excludedTypeBuildItems.produce(new ExcludedTypeBuildItem(DOTNAME_RENARDE_FORM_LOGIN_CONTROLLER.toString()));
+            ClassInfo klass = indexBuildItem.getIndex().getClassByName(DOTNAME_RENARDE_FORM_LOGIN_CONTROLLER);
+            // don't exclude it if the user didn't import the security module
+            if (klass != null) {
+                buildTimeConditionBuildItems.produce(new BuildTimeConditionBuildItem(klass, false));
+            }
+        }
+    }
+
+    @BuildStep
+    @Record(ExecutionTime.STATIC_INIT)
+    void configureLoginPage(RenardeRecorder recorder,
+            LoginPageBuildItem loginPageBuildItem,
+            BeanContainerBuildItem beanContainerBuildItem,
+            HttpRootPathBuildItem httpRootPath) {
+        String loginPage;
+        if (loginPageBuildItem != null) {
+            loginPage = loginPageBuildItem.uri;
+        } else {
+            Config config = ConfigProvider.getConfig();
+            // if we have a single provider it's easy
+            String oidcLoginPage = null;
+            for (String provider : SUPPORTED_OIDC_PROVIDERS) {
+                if (config.getOptionalValue("quarkus.oidc." + provider + ".tenant-enabled", Boolean.class).orElse(true) &&
+                        (config.getOptionalValue("quarkus.oidc." + provider + ".provider", String.class).isPresent()
+                                || config.getOptionalValue("quarkus.oidc." + provider + ".client-id", String.class)
+                                        .isPresent())) {
+                    if (oidcLoginPage == null) {
+                        oidcLoginPage = "/_renarde/security/login-" + provider;
+                    } else {
+                        // two providers, we can't choose, fall back to root
+                        oidcLoginPage = null;
+                        break;
+                    }
+                }
+            }
+            if (oidcLoginPage != null) {
+                loginPage = oidcLoginPage;
+            } else {
+                loginPage = "/";
+            }
+        }
+        loginPage = prependRootPath(httpRootPath.getRootPath(), loginPage);
+        recorder.configureLoginPage(beanContainerBuildItem.getValue(), loginPage);
+    }
+
+    /**
+     * Prepends the HTTP root path to the given path.
+     * <p>
+     * If the root path is {@code "/"}, the path is returned unchanged.
+     * If the given path is {@code "/"}, only the root path is returned.
+     * Otherwise, the root path is prepended to the path, taking care to avoid double slashes.
+     *
+     * @param rootPath the HTTP root path (e.g. {@code "/my-app"} or {@code "/"})
+     * @param path the path to prepend the root path to (e.g. {@code "/_renarde/security/login"})
+     * @return the path with the root path prepended (e.g. {@code "/my-app/_renarde/security/login"})
+     */
+    private static String prependRootPath(String rootPath, String path) {
+        if (rootPath.equals("/")) {
+            return path;
+        }
+        if (rootPath.endsWith("/")) {
+            rootPath = rootPath.substring(0, rootPath.length() - 1);
+        }
+        if (path.equals("/")) {
+            return rootPath;
+        }
+        return rootPath + path;
+    }
+
+    @BuildStep
+    @Record(ExecutionTime.STATIC_INIT)
+    void findMessageFiles(RenardeRecorder recorder,
+            BeanContainerBuildItem beanContainerBuildItem,
+            ApplicationArchivesBuildItem applicationArchivesBuildItem,
+            LocalesBuildTimeConfig locales,
+            BuildProducer<NativeImageResourceBuildItem> nativeImageResources,
+            BuildProducer<HotDeploymentWatchedFileBuildItem> watchedFiles) throws IOException {
+
+        Map<String, Path> languageToPath = new HashMap<>();
+
+        for (ApplicationArchive archive : applicationArchivesBuildItem.getAllApplicationArchives()) {
+            archive.accept(tree -> {
+                for (Path root : tree.getRoots()) {
+                    try (Stream<Path> files = Files.list(root)) {
+                        Iterator<Path> iter = files.iterator();
+                        while (iter.hasNext()) {
+                            Path filePath = iter.next();
+                            String name = filePath.getFileName().toString();
+                            if (Files.isRegularFile(filePath)
+                                    && (name.startsWith("messages.")
+                                            || name.startsWith("messages_"))
+                                    && name.endsWith(".properties")) {
+                                String language;
+                                if (name.startsWith("messages.")) {
+                                    // default language
+                                    language = locales.defaultLocale().orElse(Locale.getDefault()).getLanguage();
+                                } else {
+                                    // messages_lang.properties
+                                    language = name.substring(9, name.length() - 11);
+                                }
+                                Path relativePath = root.relativize(filePath);
+                                languageToPath.put(language, relativePath);
+                            }
+                        }
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                }
+            });
+        }
+
+        // FIXME: should not cause a full restart
+        // Hot deployment and native-image
+        for (Path messageFileName : languageToPath.values()) {
+            watchedFiles.produce(new HotDeploymentWatchedFileBuildItem(messageFileName.toString()));
+            nativeImageResources.produce(new NativeImageResourceBuildItem(messageFileName.toString()));
+        }
+
+        for (Entry<String, Path> entry : languageToPath.entrySet()) {
+            recorder.addLanguageBundle(beanContainerBuildItem.getValue(), entry.getKey(), entry.getValue().toString());
+        }
+
+        for (Locale locale : locales.locales()) {
+            String lang = locale.getLanguage();
+            if (!languageToPath.containsKey(lang)) {
+                logger.warnf(
+                        "Locale %s is declared in 'quarkus.locales' but no matching messages_%s.properties resource file found",
+                        lang, lang);
+            }
+        }
+        if (!languageToPath.isEmpty()) {
+            logger.infof("Supported locales with messages: %s", languageToPath.keySet());
+        }
+    }
+
+    @BuildStep(onlyIf = { IsLocalDevelopment.class })
+    public CardPageBuildItem create() {
+        CardPageBuildItem card = new CardPageBuildItem();
+        card.setLogo("renarde-head.svg", "renarde-head.svg");
+        return card;
+    }
+
 }

@@ -2,14 +2,14 @@ package io.quarkiverse.renarde.oidc.impl;
 
 import java.util.Map.Entry;
 
-import javax.enterprise.context.ApplicationScoped;
-import javax.inject.Inject;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
-import io.quarkus.oidc.OidcTenantConfig;
 import io.quarkus.oidc.TenantResolver;
 import io.quarkus.oidc.runtime.OidcConfig;
+import io.quarkus.oidc.runtime.OidcTenantConfig;
 import io.quarkus.oidc.runtime.OidcUtils;
 import io.vertx.core.http.Cookie;
 import io.vertx.ext.web.RoutingContext;
@@ -29,8 +29,8 @@ public class RenardeTenantResolver implements TenantResolver {
         if (knownTenant != null)
             return knownTenant;
         // Named tenants
-        for (Entry<String, OidcTenantConfig> tenantEntry : oidcConfig.namedTenants.entrySet()) {
-            if (!tenantEntry.getValue().tenantEnabled)
+        for (Entry<String, OidcTenantConfig> tenantEntry : oidcConfig.namedTenants().entrySet()) {
+            if (!tenantEntry.getValue().tenantEnabled())
                 continue;
             String tenant = tenantEntry.getKey();
             // First case: login

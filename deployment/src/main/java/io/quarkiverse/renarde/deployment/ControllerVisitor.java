@@ -3,6 +3,7 @@ package io.quarkiverse.renarde.deployment;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.BiFunction;
 
 import org.jboss.jandex.DotName;
@@ -16,11 +17,18 @@ import org.objectweb.asm.Opcodes;
 import io.quarkiverse.renarde.Controller;
 import io.quarkiverse.renarde.router.Router;
 import io.quarkus.deployment.util.AsmUtil;
+import io.quarkus.runtime.LaunchMode;
 import io.quarkus.runtime.util.HashUtil;
 
+/**
+ * This visitor augments controllers, to generate methods for building URIs and replacing calls
+ * to controller public methods to replace them with redirects. See AugmentedController in the tests
+ * for a manually augmented version to explain what we do here.
+ */
 public class ControllerVisitor implements BiFunction<String, ClassVisitor, ClassVisitor> {
 
     public static final DotName DOTNAME_LONG = DotName.createSimple(Long.class.getName());
+    public static final DotName DOTNAME_OPTIONAL = DotName.createSimple(Optional.class.getName());
 
     public static final String ROUTER_BINARY_NAME = Router.class.getName().replace('.', '/');
     public static final String CONTROLLER_BINARY_NAME = Controller.class.getName().replace('.', '/');
@@ -145,6 +153,10 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
                         ControllerClass ownerController = controllers.get(ownerClass);
                         String key = name + "/" + descriptor;
                         if (ownerController != null && ownerController.methods.get(key) != null) {
+                            // first invoke the redirect hook this.beforeRedirect()
+                            super.visitIntInsn(Opcodes.ALOAD, 0);
+                            super.visitMethodInsn(Opcodes.INVOKEVIRTUAL, CONTROLLER_BINARY_NAME, "beforeRedirect", "()V",
+                                    false);
                             /*
                              * We turn this.method(…) calls into (static) __redirect$method(…) calls
                              */
@@ -216,10 +228,28 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
                 visitor.visitVarInsn(Opcodes.ALOAD, 1);
                 visitor.visitIntInsn(Opcodes.BIPUSH, index);
                 visitor.visitInsn(Opcodes.AALOAD);
-                if (parameterType.kind() == Kind.PRIMITIVE) {
-                    unboxOrWidenIfRequired(visitor, parameterType);
+                if (parameterType.name().equals(DOTNAME_OPTIONAL)) {
+                    // wrap into an optional, unless already optional,
+                    // because this is called from both Router.getURI with optional values, and Qute which does not have optional values
+                    visitor.visitMethodInsn(Opcodes.INVOKESTATIC, Router.class.getName().replace('.', '/'), "ofNullable",
+                            "(Ljava/lang/Object;)Ljava/util/Optional;", false);
                 } else {
-                    visitor.visitTypeInsn(Opcodes.CHECKCAST, parameterType.name().toString('/'));
+                    // Boxing is required because LDC cannot load primitive class constants (e.g. int.class)
+                    org.objectweb.asm.Type asmType;
+                    if (parameterType.kind() == Kind.PRIMITIVE) {
+                        asmType = AsmUtil.autobox(org.objectweb.asm.Type.getType(parameterType.descriptor()));
+                    } else {
+                        asmType = org.objectweb.asm.Type.getObjectType(parameterType.name().toString('/'));
+                    }
+                    // Convert String values (e.g. from Qute templates) to the expected type via Router.convertParam(Object, Class)
+                    visitor.visitLdcInsn(asmType);
+                    visitor.visitMethodInsn(Opcodes.INVOKESTATIC, ROUTER_BINARY_NAME, "convertParam",
+                            "(Ljava/lang/Object;Ljava/lang/Class;)Ljava/lang/Object;", false);
+                    if (parameterType.kind() == Kind.PRIMITIVE) {
+                        unboxOrWidenIfRequired(visitor, parameterType);
+                    } else {
+                        visitor.visitTypeInsn(Opcodes.CHECKCAST, parameterType.name().toString('/'));
+                    }
                 }
 
                 visitor.visitJumpInsn(Opcodes.GOTO, end);
@@ -244,6 +274,9 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
                             visitor.visitInsn(Opcodes.LCONST_0);
                             break;
                     }
+                } else if (parameterType.name().equals(DOTNAME_OPTIONAL)) {
+                    visitor.visitMethodInsn(Opcodes.INVOKESTATIC, "java/util/Optional", "empty",
+                            "()Ljava/util/Optional;", false);
                 } else {
                     visitor.visitInsn(Opcodes.ACONST_NULL);
                 }
@@ -304,8 +337,8 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
             // same signature makes it easier for callers
             MethodVisitor visitor = super.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
                     "__redirect$" + method.name, method.descriptor, null, null);
-            // redirect(uri(false, param1, param2))
-            visitor.visitInsn(Opcodes.ICONST_0);
+            // redirect(uri(true, param1, param2))
+            visitor.visitInsn(Opcodes.ICONST_1);
             int index = 0;
             for (Type parameterType : method.parameters) {
                 visitor.visitVarInsn(AsmUtil.getLoadOpcode(parameterType), index);
@@ -313,7 +346,7 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
             }
             visitor.visitMethodInsn(Opcodes.INVOKESTATIC, className, "__uri$" + method.name, uriDescriptor(method), false);
             visitor.visitMethodInsn(Opcodes.INVOKESTATIC, CONTROLLER_BINARY_NAME, "seeOther",
-                    "(Ljava/net/URI;)Ljavax/ws/rs/core/Response;", false);
+                    "(Ljava/net/URI;)Ljakarta/ws/rs/core/Response;", false);
             visitor.visitInsn(Opcodes.POP);
 
             int lastParen = method.descriptor.lastIndexOf(')');
@@ -344,7 +377,7 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
         }
 
         private String uriDescriptor(ControllerMethod method) {
-            // same signature but takes extra boolean and returns a String
+            // same signature but takes extra boolean and returns a URI
             int lastParen = method.descriptor.lastIndexOf(')');
             return "(Z" + method.descriptor.substring(1, lastParen + 1) + "Ljava/net/URI;";
         }
@@ -360,16 +393,21 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
                     "__uri$" + method.name, descriptor, null, null);
             // UriBuilder uri = Router.getUriBuilder(absolute)
             visitor.visitVarInsn(Opcodes.ILOAD, 0);
-            visitor.visitMethodInsn(Opcodes.INVOKESTATIC, ROUTER_BINARY_NAME, "getUriBuilder",
-                    "(Z)Ljavax/ws/rs/core/UriBuilder;", false);
+            var staticMethod = "getUriBuilder";
+            // check if we are in test
+            if (LaunchMode.current() == LaunchMode.TEST) {
+                staticMethod = "getTestUriBuilder";
+            }
+            visitor.visitMethodInsn(Opcodes.INVOKESTATIC, ROUTER_BINARY_NAME, staticMethod,
+                    "(Z)Ljakarta/ws/rs/core/UriBuilder;", false);
             visitor.visitVarInsn(Opcodes.ASTORE, uriBuilderIndex);
             for (UriPart part : method.parts) {
                 if (part instanceof StaticUriPart) {
                     // uri.path("Users");
                     visitor.visitVarInsn(Opcodes.ALOAD, uriBuilderIndex);
                     visitor.visitLdcInsn(((StaticUriPart) part).part);
-                    visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "javax/ws/rs/core/UriBuilder", "path",
-                            "(Ljava/lang/String;)Ljavax/ws/rs/core/UriBuilder;", false);
+                    visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jakarta/ws/rs/core/UriBuilder", "path",
+                            "(Ljava/lang/String;)Ljakarta/ws/rs/core/UriBuilder;", false);
                     visitor.visitInsn(Opcodes.POP);
                 } else if (part instanceof PathParamUriPart) {
                     PathParamUriPart pathPart = (PathParamUriPart) part;
@@ -377,8 +415,8 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
                         // uri.path("{param}");
                         visitor.visitVarInsn(Opcodes.ALOAD, uriBuilderIndex);
                         visitor.visitLdcInsn("{" + pathPart.name + "}");
-                        visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "javax/ws/rs/core/UriBuilder", "path",
-                                "(Ljava/lang/String;)Ljavax/ws/rs/core/UriBuilder;", false);
+                        visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jakarta/ws/rs/core/UriBuilder", "path",
+                                "(Ljava/lang/String;)Ljakarta/ws/rs/core/UriBuilder;", false);
                         visitor.visitInsn(Opcodes.POP);
                     }
                     // uri.resolveTemplate("userName", userName);
@@ -387,21 +425,25 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
                     Type paramType = method.parameters.get(pathPart.paramIndex);
                     visitor.visitVarInsn(AsmUtil.getLoadOpcode(paramType), pathPart.asmParamIndex);
                     AsmUtil.boxIfRequired(visitor, paramType);
-                    visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "javax/ws/rs/core/UriBuilder", "resolveTemplate",
-                            "(Ljava/lang/String;Ljava/lang/Object;)Ljavax/ws/rs/core/UriBuilder;", false);
+                    visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jakarta/ws/rs/core/UriBuilder", "resolveTemplate",
+                            "(Ljava/lang/String;Ljava/lang/Object;)Ljakarta/ws/rs/core/UriBuilder;", false);
                     visitor.visitInsn(Opcodes.POP);
                 } else if (part instanceof QueryParamUriPart) {
                     /*
-                     * if(queryParam != null){
+                     * if(queryParam != null){ // or queryParam.isPresent() for Optional
                      * Object[] params = new Object[1];
-                     * params[0] = queryParam;
+                     * params[0] = queryParam; // or queryParam.get() for Optional
                      * uri.queryParam("queryParam", params);
                      * }
                      */
                     QueryParamUriPart queryPart = (QueryParamUriPart) part;
                     Type paramType = method.parameters.get(queryPart.paramIndex);
                     Label end = new Label();
-                    if (paramType.kind() != Kind.PRIMITIVE) {
+                    if (paramType.name().equals(DOTNAME_OPTIONAL)) {
+                        visitor.visitVarInsn(Opcodes.ALOAD, queryPart.asmParamIndex);
+                        visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/util/Optional", "isPresent", "()Z", false);
+                        visitor.visitJumpInsn(Opcodes.IFEQ, end);
+                    } else if (paramType.kind() != Kind.PRIMITIVE) {
                         visitor.visitVarInsn(Opcodes.ALOAD, queryPart.asmParamIndex);
                         visitor.visitJumpInsn(Opcodes.IFNULL, end);
                     }
@@ -413,9 +455,14 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
                     visitor.visitInsn(Opcodes.ICONST_0);
                     visitor.visitVarInsn(AsmUtil.getLoadOpcode(paramType), queryPart.asmParamIndex);
                     AsmUtil.boxIfRequired(visitor, paramType);
+                    // un-box from optional if required
+                    if (paramType.name().equals(DOTNAME_OPTIONAL)) {
+                        visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/util/Optional", "get", "()Ljava/lang/Object;",
+                                false);
+                    }
                     visitor.visitInsn(Opcodes.AASTORE);
-                    visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "javax/ws/rs/core/UriBuilder", "queryParam",
-                            "(Ljava/lang/String;[Ljava/lang/Object;)Ljavax/ws/rs/core/UriBuilder;", false);
+                    visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jakarta/ws/rs/core/UriBuilder", "queryParam",
+                            "(Ljava/lang/String;[Ljava/lang/Object;)Ljakarta/ws/rs/core/UriBuilder;", false);
                     visitor.visitInsn(Opcodes.POP);
                     if (paramType.kind() != Kind.PRIMITIVE) {
                         visitor.visitLabel(end);
@@ -428,7 +475,7 @@ public class ControllerVisitor implements BiFunction<String, ClassVisitor, Class
             visitor.visitVarInsn(Opcodes.ALOAD, uriBuilderIndex);
             visitor.visitInsn(Opcodes.ICONST_0);
             visitor.visitTypeInsn(Opcodes.ANEWARRAY, "java/lang/Object");
-            visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "javax/ws/rs/core/UriBuilder", "build",
+            visitor.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "jakarta/ws/rs/core/UriBuilder", "build",
                     "([Ljava/lang/Object;)Ljava/net/URI;", false);
             visitor.visitInsn(Opcodes.ARETURN);
             visitor.visitMaxs(0, 0);

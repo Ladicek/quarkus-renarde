@@ -5,14 +5,14 @@ import java.net.URISyntaxException;
 import java.util.Map;
 import java.util.UUID;
 
-import io.vertx.mutiny.ext.web.Router;
-import io.vertx.mutiny.ext.web.RoutingContext;
-import io.vertx.mutiny.ext.web.handler.BodyHandler;
+import io.vertx.ext.web.Router;
+import io.vertx.ext.web.RoutingContext;
+import io.vertx.ext.web.handler.BodyHandler;
 
 public class MockTwitterOidcTestResource extends MockOidcTestResource<MockTwitterOidc> {
 
     public MockTwitterOidcTestResource() {
-        super("twitter", 50005);
+        super("twitter");
     }
 
     @Override
@@ -64,7 +64,7 @@ public class MockTwitterOidcTestResource extends MockOidcTestResource<MockTwitte
         rc.response()
                 .putHeader("Location", redirect.toASCIIString())
                 .setStatusCode(302)
-                .endAndForget();
+                .end();
     }
 
     /*
@@ -94,7 +94,7 @@ public class MockTwitterOidcTestResource extends MockOidcTestResource<MockTwitte
         UUID rtoken = UUID.randomUUID();
         rc.response()
                 .putHeader("Content-Type", "application/json")
-                .endAndForget("{\n"
+                .end("{\n"
                         + "  \"token_type\":\"bearer\",\n"
                         + "  \"expires_in\":7200,\n"
                         + "  \"access_token\":\"" + atoken + "\",\n"
@@ -111,19 +111,19 @@ public class MockTwitterOidcTestResource extends MockOidcTestResource<MockTwitte
      * {
      * "data":
      * {
-     * "id":"ID",
-     * "name":"Stéphane Épardaud",
-     * "username":"UnFroMage"
+     * "id":"USERID",
+     * "name":"Foo Bar",
+     * "username":"TwitterUser"
      * }
      * }
      */
     private void getUser(RoutingContext rc) {
         rc.response()
                 .putHeader("Content-Type", "application/json")
-                .endAndForget("{\n"
+                .end("{\n"
                         + "  \"data\":\n"
                         + "  {\n"
-                        + "   \"id\":\"ID\",\n"
+                        + "   \"id\":\"USERID\",\n"
                         + "   \"name\":\"Foo Bar\",\n"
                         + "   \"username\":\"TwitterUser\"\n"
                         + "  }\n"

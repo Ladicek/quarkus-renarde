@@ -3,20 +3,24 @@ package io.quarkiverse.renarde;
 import java.net.URI;
 import java.net.URISyntaxException;
 
-import javax.inject.Inject;
-import javax.ws.rs.WebApplicationException;
-import javax.ws.rs.core.Response;
-import javax.ws.rs.core.UriInfo;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.WebApplicationException;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 
 import org.jboss.resteasy.reactive.RestResponse;
 
 import io.quarkiverse.renarde.util.Flash;
+import io.quarkiverse.renarde.util.I18N;
 import io.quarkiverse.renarde.util.RedirectException;
 import io.quarkiverse.renarde.util.RenderArgs;
 import io.quarkiverse.renarde.util.Validation;
 import io.quarkus.security.identity.SecurityIdentity;
 
 public class Controller {
+
+    @Inject
+    protected I18N i18n;
 
     @Inject
     protected SecurityIdentity identity;
@@ -83,6 +87,13 @@ public class Controller {
 
     protected Response notFound() {
         throw new WebApplicationException(RestResponse.StatusCode.NOT_FOUND);
+    }
+
+    /**
+     * This hook is called before any redirects caused by calls to controller public methods,
+     * including redirect(FooController.class).method().
+     */
+    protected void beforeRedirect() {
     }
 
     protected Response seeOther(String uri) {
